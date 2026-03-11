@@ -65,6 +65,23 @@ logging.info("[SERVER] ADK Runner initialised (session: %s).", SESSION_ID)
 
 class AgentHandler(BaseHTTPRequestHandler):
 
+    def do_GET(self) -> None:
+        """Health-check endpoint — returns 200 for GET / or GET /health."""
+        if self.path in ("/", "/health"):
+            self._send(200, {
+                "status": "ok",
+                "message": "Pricing Intelligence Agent server is running.",
+                "usage": "POST /chat  Body: {\"message\": \"<your question>\"}",
+            })
+        elif self.path == "/chat":
+            self._send(405, {
+                "error": "Method Not Allowed",
+                "message": "/chat requires POST, not GET.",
+                "usage": "POST /chat  Body: {\"message\": \"<your question>\"}",
+            })
+        else:
+            self._send(404, {"error": f"Unknown path: {self.path}"})
+
     def do_POST(self) -> None:
         if self.path != "/chat":
             self._send(404, {"error": f"Unknown path: {self.path}"})
