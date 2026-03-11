@@ -59,50 +59,36 @@ def start_dashboard() -> None:
 
 def run_startup_diagnostics() -> None:
     """
-    Query the pricing table with no active-record filter and log the raw counts.
-    This tells us immediately whether the table is empty, whether the SCD
-    columns are populated, and which filter will be selected for the session.
+    Query the pricing table and log basic health metrics.
+    price_fact_us has no SCD columns — all rows are valid.
     """
     logging.info("[MAIN] Running BigQuery startup diagnostics…")
     try:
-        from bq.queries import get_active_filter, run_diagnostic_query  # noqa: PLC0415
+        from bq.queries import run_diagnostic_query  # noqa: PLC0415
 
         diag = run_diagnostic_query()
-        active_filter = get_active_filter()
 
-        total       = diag.get("total_rows", 0)
-        strict      = diag.get("strict_active", 0)
-        relaxed     = diag.get("relaxed_active", 0)
-        rule_srcs   = diag.get("distinct_rule_sources", 0)
-        countries   = diag.get("distinct_countries", 0)
+        total      = diag.get("total_rows", 0)
+        rule_srcs  = diag.get("distinct_rule_sources", 0)
+        countries  = diag.get("distinct_countries", 0)
+        orders     = diag.get("orders", 0)
+        earliest   = diag.get("earliest_record")
+        latest     = diag.get("latest_record")
 
         if total == 0:
             logging.error(
-                "[MAIN] ⚠️  Table appears to be EMPTY (%s). "
+                "[MAIN] ⚠️  Table appears to be EMPTY (0 rows). "
                 "Check GCP_PROJECT_ID, BQ_DATASET_NAME, BQ_TABLE_NAME in config.py.",
-                "0 rows",
-            )
-        elif strict == 0 and relaxed == 0:
-            logging.warning(
-                "[MAIN] ⚠️  Both strict and relaxed filters return 0 rows "
-                "(%d total rows exist). No active-record filter will be applied.",
-                total,
-            )
-        elif strict == 0:
-            logging.warning(
-                "[MAIN] ⚠️  Strict SCD filter returns 0 rows — "
-                "db_rec_close_date may not be populated in your dataset. "
-                "Relaxed filter applied (%d rows available).",
-                relaxed,
             )
         else:
             logging.info(
                 "[MAIN] ✅ BQ connection healthy. "
-                "%d active records | %d rule sources | %d countries.",
-                strict, rule_srcs, countries,
+                "%d total rows | %d orders | %d rule sources | %d countries | "
+                "date range: %s → %s",
+                total, orders, rule_srcs, countries, earliest, latest,
             )
 
-        logging.info("[MAIN] Active filter for this session: %s", active_filter)
+        logging.info("[MAIN] No SCD filter applied — all rows in price_fact_us are active.")
 
     except Exception as exc:
         logging.error(

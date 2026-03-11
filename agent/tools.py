@@ -147,11 +147,11 @@ def get_rule_utilization() -> str:
 
 def get_country_breakdown() -> str:
     """
-    Fetch and summarise pricing-rule usage by country and region.
+    Fetch and summarise pricing-rule usage by country and company.
 
     Returns:
       • Top 5 countries by fallback rate
-      • Average margin by region
+      • Average margin by company code
     """
     logging.info("[TOOL] get_country_breakdown called")
     try:
@@ -178,15 +178,15 @@ def get_country_breakdown() -> str:
         .reset_index()
         .sort_values("fallback_rate", ascending=False)
     )
-    region = (
-        df.groupby("REGION", dropna=False)
+    company = (
+        df.groupby("company_code", dropna=False)
         .agg(avg_margin=("avg_final_price_margin", "mean"))
         .reset_index()
         .sort_values("avg_margin", ascending=False)
     )
 
     lines = [
-        "Country / Region Breakdown",
+        "Country / Company Breakdown",
         "=" * 60,
         "",
         "Top 5 countries by fallback rule rate:",
@@ -198,12 +198,12 @@ def get_country_breakdown() -> str:
             f"  avg margin: {row['avg_margin']:>8.4f}"
             f"  records: {row['records']:>8,.0f}"
         )
-    lines += ["", "Average margin by region:"]
-    for _, row in region.iterrows():
+    lines += ["", "Average margin by company code:"]
+    for _, row in company.head(10).iterrows():
         lines.append(
-            f"  {row['REGION'] or 'UNKNOWN':20s}  avg margin: {row['avg_margin']:>8.4f}"
+            f"  {row['company_code'] or 'UNKNOWN':20s}  avg margin: {row['avg_margin']:>8.4f}"
         )
-    lines.append("\nCharts are available on the Country & Region tab of the dashboard.")
+    lines.append("\nCharts are available on the Country & Company tab of the dashboard.")
     return "\n".join(lines)
 
 
@@ -299,9 +299,9 @@ def get_pricing_leakage_alerts(margin_threshold: float = 0.10) -> str:
     _persist_state()
 
     total      = len(df)
-    low_margin = (df["low_margin_flag"] == "low_margin").sum()
-    floor_hit  = (df["floor_hit_flag"] == "floor_hit").sum()
-    override   = (df["override_flag"] == "manual_override").sum()
+    low_margin = (df["leakage_type"] == "low_margin").sum()
+    floor_hit  = (df["leakage_type"] == "floor_hit").sum()
+    override   = (df["leakage_type"] == "override").sum()
 
     top_skus = (
         df.groupby("sku_number", dropna=False)

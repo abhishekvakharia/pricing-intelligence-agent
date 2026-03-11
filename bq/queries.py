@@ -2,10 +2,17 @@
 bq/queries.py
 All BigQuery query functions for the Pricing Intelligence Agent.
 
-Every query uses BQ_FULL_TABLE from config.py.  The active-record filter
-is now *adaptive*: on first call, run_diagnostic_query() inspects the actual
-data and chooses the least-restrictive filter that still returns rows.  This
-prevents the common "0 rows" issue when db_rec_close_date is not populated.
+Every query uses BQ_FULL_TABLE from config.py.
+
+NOTE on schema:
+  - price_fact_us has NO SCD columns (db_rec_del_flag, db_rec_close_date,
+    db_rec_begin_date, db_prcsd_dttm, batch_number) — all rows are valid.
+  - Flag columns (cost_override_flag, special_price_override_flag,
+    allow_floor_flag, skip_bump_flag, etc.) are BOOL — compare with = TRUE.
+  - final_cost and currency_exchange_rate are stored as STRING — CAST to
+    FLOAT64 before arithmetic.
+  - REGION, VENDOR_LOB_LVL2_DES, VENDOR_LOB_LVL3_DES, SoW_final_org_scale,
+    price_fact_key are NOT in the table — never reference them.
 """
 
 import logging
@@ -62,31 +69,41 @@ def _get_date_filter(
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic query — run once at startup, no active-record filter
+# Active-record filter — no SCD columns exist in this table
+# ---------------------------------------------------------------------------
+
+def get_active_filter() -> str:
+    """
+    The price_fact_us table does not have SCD columns (db_rec_del_flag,
+    db_rec_close_date).  No active-record filter is needed — all rows
+    are valid.
+    """
+    logging.info(
+        "[BQ] No SCD filter applied — price_fact_us has no soft-delete columns"
+    )
+    return "1=1"
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic query — basic health check
 # ---------------------------------------------------------------------------
 
 def run_diagnostic_query() -> dict:
     """
-    Run raw, unfiltered counts against the pricing table to diagnose why
-    active-record filters may return 0 rows.
+    Run unfiltered counts against the pricing table for a quick health check.
 
-    Returns a dict with counts broken down by filter conditions so callers
-    can decide which filter to apply.
+    Returns a dict with row counts and date range.
     """
     sql = f"""
     SELECT
-        COUNT(*)                                                           AS total_rows,
-        COUNTIF(db_rec_del_flag = 'Y')                                     AS del_flag_y,
-        COUNTIF(db_rec_del_flag != 'Y')                                    AS del_flag_not_y,
-        COUNTIF(db_rec_del_flag IS NULL)                                   AS del_flag_null,
-        COUNTIF(db_rec_close_date IS NULL)                                 AS close_date_null,
-        COUNTIF(db_rec_close_date IS NOT NULL)                             AS close_date_not_null,
-        COUNTIF(db_rec_del_flag != 'Y' AND db_rec_close_date IS NULL)      AS strict_active,
-        COUNTIF(db_rec_del_flag IS NULL OR db_rec_del_flag != 'Y')         AS relaxed_active,
-        COUNT(DISTINCT price_rule_source)                                  AS distinct_rule_sources,
-        COUNT(DISTINCT country_code)                                       AS distinct_countries,
-        MIN(created)                                                       AS earliest_record,
-        MAX(created)                                                       AS latest_record
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT country_code) AS distinct_countries,
+        COUNT(DISTINCT pricing_rule) AS distinct_rules,
+        COUNT(DISTINCT price_rule_source) AS distinct_rule_sources,
+        COUNTIF(order_key IS NOT NULL) AS orders,
+        COUNTIF(order_key IS NULL) AS quotes_only,
+        MIN(created) AS earliest_record,
+        MAX(created) AS latest_record
     FROM `{BQ_FULL_TABLE}`
     """
     logging.info("[BQ] Running diagnostic query on %s", BQ_FULL_TABLE)
@@ -95,55 +112,6 @@ def run_diagnostic_query() -> dict:
     result = dict(row)
     logging.info("[BQ] Diagnostics: %s", result)
     return result
-
-
-# ---------------------------------------------------------------------------
-# Adaptive active-record filter — module-level cache
-# ---------------------------------------------------------------------------
-
-_diag_cache: dict | None = None
-_active_filter_cache: str | None = None
-
-
-def _get_active_filter(diag: dict) -> str:
-    """
-    Choose the right WHERE clause based on what the data actually contains.
-
-    Priority:
-      1. Strict SCD filter (both columns populated and meaningful)
-      2. Relaxed filter (only del_flag checked; close_date ignored)
-      3. No filter at all (last resort — includes all rows)
-    """
-    if diag["strict_active"] > 0:
-        logging.info("[BQ] Strict SCD filter viable (%d rows).", diag["strict_active"])
-        return "db_rec_del_flag != 'Y' AND db_rec_close_date IS NULL"
-    elif diag["relaxed_active"] > 0:
-        logging.warning(
-            "[BQ] Strict SCD filter returns 0 rows (db_rec_close_date may be unpopulated). "
-            "Falling back to relaxed filter (del_flag only). %d rows available.",
-            diag["relaxed_active"],
-        )
-        return "(db_rec_del_flag IS NULL OR db_rec_del_flag != 'Y')"
-    else:
-        logging.warning(
-            "[BQ] Both strict and relaxed filters return 0 rows. "
-            "Removing active-record filter entirely — all %d rows will be included.",
-            diag["total_rows"],
-        )
-        return "1=1"
-
-
-def get_active_filter() -> str:
-    """
-    Return the appropriate active-record WHERE clause, running the diagnostic
-    query on first call and caching the result for the rest of the session.
-    """
-    global _diag_cache, _active_filter_cache
-    if _active_filter_cache is None:
-        _diag_cache = run_diagnostic_query()
-        _active_filter_cache = _get_active_filter(_diag_cache)
-        logging.info("[BQ] Active filter selected: %s", _active_filter_cache)
-    return _active_filter_cache
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +124,8 @@ def fetch_rule_utilization(
     date_to: str | None = None,
 ) -> pd.DataFrame:
     """
-    Returns per-rule-source / rule / country / region / vendor-LOB breakdown
-    with record count, avg margin, avg calculated price, and conversion rate.
+    Returns per-rule-source / rule / country / company breakdown with record
+    count, avg margin, avg calculated price, and conversion rate.
 
     Parameters
     ----------
@@ -168,40 +136,41 @@ def fetch_rule_utilization(
     date_to : str | None
         Optional upper date bound for the `created` column (YYYY-MM-DD).
     """
-    active_filter = get_active_filter()
     date_filter = _get_date_filter(date_from, date_to)
     sql = f"""
     SELECT
         price_rule_source,
         pricing_rule,
         country_code,
-        REGION,
-        VENDOR_LOB_LVL2_DES,
-        COUNT(*)                                                        AS record_count,
-        ROUND(AVG(final_price_margin), 4)                               AS avg_final_price_margin,
-        ROUND(AVG(calculated_price * COALESCE(currency_exchange_rate, 1)), 4)
-                                                                        AS avg_calculated_price_base_ccy,
+        company_code,
+        COUNT(*) AS record_count,
+        ROUND(AVG(final_price_margin), 4) AS avg_final_price_margin,
+        ROUND(
+            AVG(calculated_price * CAST(COALESCE(NULLIF(currency_exchange_rate, ''), '1') AS FLOAT64)),
+            4
+        ) AS avg_calculated_price_base_ccy,
         ROUND(
             SAFE_DIVIDE(
                 COUNTIF(order_key IS NOT NULL),
                 COUNT(*)
             ) * 100, 2
-        )                                                               AS conversion_rate_pct
+        ) AS conversion_rate_pct,
+        COUNTIF(cost_override_flag = TRUE) AS cost_override_count,
+        COUNTIF(special_price_override_flag = TRUE) AS special_override_count
     FROM `{BQ_FULL_TABLE}`
-    WHERE {active_filter}
+    WHERE 1=1
     {date_filter}
     GROUP BY
         price_rule_source,
         pricing_rule,
         country_code,
-        REGION,
-        VENDOR_LOB_LVL2_DES
+        company_code
     ORDER BY record_count DESC
     LIMIT {limit}
     """
     logging.info(
-        "[BQ] Executing fetch_rule_utilization (filter: %s, dates: %s → %s)",
-        active_filter, date_from or "unbounded", date_to or "unbounded",
+        "[BQ] Executing fetch_rule_utilization (dates: %s → %s)",
+        date_from or "unbounded", date_to or "unbounded",
     )
     df = _run(sql)
     logging.info("[BQ] fetch_rule_utilization returned %d rows", len(df))
@@ -209,7 +178,7 @@ def fetch_rule_utilization(
 
 
 # ---------------------------------------------------------------------------
-# 2. Country / region breakdown
+# 2. Country / company breakdown
 # ---------------------------------------------------------------------------
 
 def fetch_country_breakdown(
@@ -217,7 +186,7 @@ def fetch_country_breakdown(
     date_to: str | None = None,
 ) -> pd.DataFrame:
     """
-    Returns per-country/region/rule-source aggregates including fallback rate.
+    Returns per-country/company/rule-source aggregates including fallback rate.
 
     Parameters
     ----------
@@ -226,33 +195,38 @@ def fetch_country_breakdown(
     date_to : str | None
         Optional upper date bound for the `created` column (YYYY-MM-DD).
     """
-    active_filter = get_active_filter()
     date_filter = _get_date_filter(date_from, date_to)
     sql = f"""
     SELECT
         country_code,
-        REGION,
+        company_code,
         price_rule_source,
-        COUNT(*)                                                        AS record_count,
-        ROUND(AVG(final_price_margin), 4)                               AS avg_final_price_margin,
+        COUNT(*) AS record_count,
+        ROUND(AVG(final_price_margin), 4) AS avg_final_price_margin,
         ROUND(
             SAFE_DIVIDE(
                 COUNTIF(UPPER(price_rule_source) = 'DEFAULT'),
                 COUNT(*)
             ) * 100, 2
-        )                                                               AS fallback_rate_pct
+        ) AS fallback_rate_pct,
+        ROUND(
+            SAFE_DIVIDE(
+                COUNTIF(order_key IS NOT NULL),
+                COUNT(*)
+            ) * 100, 2
+        ) AS conversion_rate_pct
     FROM `{BQ_FULL_TABLE}`
-    WHERE {active_filter}
+    WHERE 1=1
     {date_filter}
     GROUP BY
         country_code,
-        REGION,
+        company_code,
         price_rule_source
     ORDER BY record_count DESC
     """
     logging.info(
-        "[BQ] Executing fetch_country_breakdown (filter: %s, dates: %s → %s)",
-        active_filter, date_from or "unbounded", date_to or "unbounded",
+        "[BQ] Executing fetch_country_breakdown (dates: %s → %s)",
+        date_from or "unbounded", date_to or "unbounded",
     )
     df = _run(sql)
     logging.info("[BQ] fetch_country_breakdown returned %d rows", len(df))
@@ -272,7 +246,7 @@ def fetch_leakage_candidates(
     Returns records exhibiting one or more leakage signals:
       • margin_pct < margin_threshold  (low-margin)
       • calculated_price = engine_floor_price  (floor-hit)
-      • overriden_price IS NOT NULL  (manual override)
+      • cost_override_flag = TRUE or special_price_override_flag = TRUE (override)
 
     Parameters
     ----------
@@ -283,53 +257,48 @@ def fetch_leakage_candidates(
     date_to : str | None
         Optional upper date bound for the `created` column (YYYY-MM-DD).
     """
-    active_filter = get_active_filter()
     date_filter = _get_date_filter(date_from, date_to)
     sql = f"""
     SELECT
         sku_number,
-        customer_number,
+        CAST(customer_number AS STRING) AS customer_number,
         country_code,
         pricing_rule,
         price_rule_source,
         calculated_price,
-        final_cost,
+        CAST(final_cost AS FLOAT64) AS final_cost,
         final_price_margin,
         overriden_price,
         engine_floor_price,
+        cost_override_flag,
+        special_price_override_flag,
         ROUND(
-            SAFE_DIVIDE(final_price_margin, calculated_price) * 100, 2
-        )                                                               AS margin_pct,
+            SAFE_DIVIDE(final_price_margin, NULLIF(calculated_price, 0)) * 100, 2
+        ) AS margin_pct,
         CASE
-            WHEN SAFE_DIVIDE(final_price_margin, calculated_price) < {margin_threshold}
+            WHEN SAFE_DIVIDE(final_price_margin, NULLIF(calculated_price, 0)) < {margin_threshold}
                 THEN 'low_margin'
-            ELSE NULL
-        END                                                             AS low_margin_flag,
-        CASE
             WHEN calculated_price = engine_floor_price
                 THEN 'floor_hit'
-            ELSE NULL
-        END                                                             AS floor_hit_flag,
-        CASE
-            WHEN overriden_price IS NOT NULL
-                THEN 'manual_override'
-            ELSE NULL
-        END                                                             AS override_flag,
-        db_rec_begin_date,
+            WHEN cost_override_flag = TRUE OR special_price_override_flag = TRUE
+                THEN 'override'
+            ELSE 'other'
+        END AS leakage_type,
         created
     FROM `{BQ_FULL_TABLE}`
-    WHERE {active_filter}
+    WHERE (
+        SAFE_DIVIDE(final_price_margin, NULLIF(calculated_price, 0)) < {margin_threshold}
+        OR calculated_price = engine_floor_price
+        OR cost_override_flag = TRUE
+        OR special_price_override_flag = TRUE
+    )
     {date_filter}
-      AND (
-            SAFE_DIVIDE(final_price_margin, calculated_price) < {margin_threshold}
-         OR calculated_price = engine_floor_price
-         OR overriden_price IS NOT NULL
-      )
     ORDER BY final_price_margin ASC
+    LIMIT 10000
     """
     logging.info(
-        "[BQ] Executing fetch_leakage_candidates (threshold=%s, filter: %s, dates: %s → %s)",
-        margin_threshold, active_filter, date_from or "unbounded", date_to or "unbounded",
+        "[BQ] Executing fetch_leakage_candidates (threshold=%s, dates: %s → %s)",
+        margin_threshold, date_from or "unbounded", date_to or "unbounded",
     )
     df = _run(sql)
     logging.info("[BQ] fetch_leakage_candidates returned %d rows", len(df))
@@ -355,7 +324,6 @@ def fetch_revenue_opportunity(
     date_to : str | None
         Optional upper date bound for the `created` column (YYYY-MM-DD).
     """
-    active_filter = get_active_filter()
     date_filter = _get_date_filter(date_from, date_to)
     sql = f"""
     WITH base AS (
@@ -366,7 +334,7 @@ def fetch_revenue_opportunity(
             final_price_margin,
             calculated_price
         FROM `{BQ_FULL_TABLE}`
-        WHERE {active_filter}
+        WHERE 1=1
         {date_filter}
           AND calculated_price > 0
     ),
@@ -408,8 +376,8 @@ def fetch_revenue_opportunity(
     LIMIT 200
     """
     logging.info(
-        "[BQ] Executing fetch_revenue_opportunity (filter: %s, dates: %s → %s)",
-        active_filter, date_from or "unbounded", date_to or "unbounded",
+        "[BQ] Executing fetch_revenue_opportunity (dates: %s → %s)",
+        date_from or "unbounded", date_to or "unbounded",
     )
     df = _run(sql)
     logging.info("[BQ] fetch_revenue_opportunity returned %d rows", len(df))

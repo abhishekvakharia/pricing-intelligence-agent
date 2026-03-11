@@ -432,25 +432,25 @@ with tabs[2]:
             )
             st.plotly_chart(fig_fallback, use_container_width=True)
 
-        st.subheader("Rule Source Mix by Region")
-        region_source = (
-            df_country.groupby(["REGION", "price_rule_source"], dropna=False)["record_count"]
+        st.subheader("Rule Source Mix by Company Code")
+        company_source = (
+            df_country.groupby(["company_code", "price_rule_source"], dropna=False)["record_count"]
             .sum().reset_index()
         )
-        fig_region_stack = px.bar(
-            region_source,
-            x="REGION",
+        fig_company_stack = px.bar(
+            company_source,
+            x="company_code",
             y="record_count",
             color="price_rule_source",
             barmode="stack",
             labels={
                 "record_count": "Record Count",
-                "REGION": "Region",
+                "company_code": "Company Code",
                 "price_rule_source": "Rule Source",
             },
             color_discrete_sequence=px.colors.qualitative.Set2,
         )
-        st.plotly_chart(fig_region_stack, use_container_width=True)
+        st.plotly_chart(fig_company_stack, use_container_width=True)
 
         _dev_expander(df_country, "Raw Country Breakdown Data")
 
@@ -520,9 +520,9 @@ with tabs[4]:
         _empty_state("Flag all pricing leakage records with margin below 10 %")
     else:
         total_leak = len(df_leak)
-        low_margin_cnt = (df_leak["low_margin_flag"] == "low_margin").sum()
-        floor_hit_cnt = (df_leak["floor_hit_flag"] == "floor_hit").sum()
-        override_cnt = (df_leak["override_flag"] == "manual_override").sum()
+        low_margin_cnt = (df_leak["leakage_type"] == "low_margin").sum()
+        floor_hit_cnt = (df_leak["leakage_type"] == "floor_hit").sum()
+        override_cnt = (df_leak["leakage_type"] == "override").sum()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Leakage Records", f"{total_leak:,}")
@@ -555,12 +555,6 @@ with tabs[4]:
         with col2:
             st.subheader("Price vs Margin (coloured by leakage type)")
             scatter_df = df_leak.copy()
-            scatter_df["leakage_type"] = (
-                scatter_df["low_margin_flag"]
-                .fillna(scatter_df["floor_hit_flag"])
-                .fillna(scatter_df["override_flag"])
-                .fillna("other")
-            )
             fig_scatter = px.scatter(
                 scatter_df.head(2000),
                 x="calculated_price",
@@ -575,7 +569,7 @@ with tabs[4]:
                 color_discrete_map={
                     "low_margin": "#e74c3c",
                     "floor_hit": "#e67e22",
-                    "manual_override": "#9b59b6",
+                    "override": "#9b59b6",
                     "other": "#95a5a6",
                 },
             )
@@ -585,8 +579,7 @@ with tabs[4]:
         display_cols = [
             "sku_number", "customer_number", "country_code",
             "pricing_rule", "calculated_price", "final_cost",
-            "final_price_margin", "margin_pct",
-            "low_margin_flag", "floor_hit_flag", "override_flag",
+            "final_price_margin", "margin_pct", "leakage_type",
         ]
         display_cols = [c for c in display_cols if c in df_leak.columns]
         st.dataframe(df_leak[display_cols].head(20), use_container_width=True)

@@ -9,40 +9,54 @@ Endpoint:
     Body:  { "message": "<user prompt>" }
     Returns: { "response": "<agent reply>", "metadata": { ... } }
 
-Metadata keys returned (best-effort — the ADK runner may not expose all):
-    tool_called   : str  — name of the last tool the agent invoked
-    rows_returned : int  — number of BQ rows returned by that tool
-    error         : str  — exception message if the call failed
-    logs          : str  — last 20 lines of agent_session.log
+Compatible with google-adk 0.4.x which requires Runner to receive an explicit
+session_service and run() to receive a genai_types.Content message.
 
 Called from main.py via start_agent_server().
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types as genai_types
+
+from agent.agent import root_agent, session_service
 
 # ---------------------------------------------------------------------------
-# Bootstrap ADK runner  (imported lazily to avoid circular deps at module load)
+# Constants
 # ---------------------------------------------------------------------------
 
-_runner = None
+APP_NAME   = "pricing_intelligence_agent"
+USER_ID    = "default_user"
+SESSION_ID = "default_session"
 
+# ---------------------------------------------------------------------------
+# Runner + session bootstrap
+# ---------------------------------------------------------------------------
 
-def _get_runner():
-    """Lazily initialise the ADK Runner the first time a request arrives."""
-    global _runner
-    if _runner is None:
-        from google.adk.runners import Runner  # noqa: PLC0415
-        from agent.agent import root_agent     # noqa: PLC0415
-        _runner = Runner(agent=root_agent)
-        logging.info("[SERVER] ADK Runner initialised.")
-    return _runner
+runner = Runner(
+    agent=root_agent,
+    app_name=APP_NAME,
+    session_service=session_service,
+)
+
+# Pre-create the session so the first message doesn't race against session init
+asyncio.get_event_loop().run_until_complete(
+    session_service.create_session(
+        app_name=APP_NAME,
+        user_id=USER_ID,
+        session_id=SESSION_ID,
+    )
+)
+logging.info("[SERVER] ADK Runner initialised (session: %s).", SESSION_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +70,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": f"Unknown path: {self.path}"})
             return
 
-        # Read body
+        # Parse body
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -72,35 +86,37 @@ class AgentHandler(BaseHTTPRequestHandler):
 
         logging.info("[SERVER] Received message: %.200s", user_message)
 
-        # Call agent
         response_text = ""
         metadata: dict[str, Any] = {}
+
         try:
-            runner = _get_runner()
+            # Build a Content object as required by ADK 0.4.x
+            content = genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=user_message)],
+            )
 
-            # The ADK Runner API varies by version. We try run_turn() first
-            # (returns (text, metadata)) then fall back to run() which may
-            # only return text.
-            if hasattr(runner, "run_turn"):
-                result = runner.run_turn(user_message)
-                if isinstance(result, tuple) and len(result) == 2:
-                    response_text, raw_meta = result
-                    if isinstance(raw_meta, dict):
-                        metadata.update(raw_meta)
-                else:
-                    response_text = str(result)
-            else:
-                # Older ADK — run() blocks until the agent produces output
-                response_text = runner.run(user_message)
+            # runner.run() is a synchronous generator of events
+            for event in runner.run(
+                user_id=USER_ID,
+                session_id=SESSION_ID,
+                new_message=content,
+            ):
+                if event.is_final_response():
+                    if event.content and event.content.parts:
+                        response_text = event.content.parts[0].text
+                    break
 
-            logging.info("[SERVER] Agent replied (first 200 chars): %.200s", response_text)
+            logging.info(
+                "[SERVER] Agent replied (first 200 chars): %.200s", response_text
+            )
 
         except Exception as agent_err:
             logging.error("[SERVER] Agent error: %s", agent_err, exc_info=True)
             response_text = f"Agent error: {agent_err}"
             metadata["error"] = str(agent_err)
 
-        # Append last 20 log lines for the dashboard dev panel
+        # Attach last 20 log lines for the dashboard dev panel
         metadata["logs"] = _tail_log(20)
 
         self._send(200, {"response": response_text, "metadata": metadata})
@@ -116,7 +132,6 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Route BaseHTTPServer access logs through Python logging
         logging.debug("[HTTP] " + fmt, *args)
 
 
@@ -143,5 +158,7 @@ def start_agent_server(port: int = 8502) -> None:
     Intended to be called from main.py as the last step in the startup sequence.
     """
     server = HTTPServer(("localhost", port), AgentHandler)
-    logging.info("[SERVER] Agent HTTP server listening on http://localhost:%d/chat", port)
+    logging.info(
+        "[SERVER] Agent HTTP server listening on http://localhost:%d/chat", port
+    )
     server.serve_forever()
