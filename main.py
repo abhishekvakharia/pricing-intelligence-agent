@@ -5,7 +5,7 @@ Entry point for the Pricing Intelligence Agent.
 Startup sequence:
   1. Initialise structured logging (JSON file + console)
   2. Start the Streamlit dashboard in a background subprocess (port 8501)
-  3. Run BigQuery diagnostics — logs table health & chooses active-record filter
+  3. Run BigQuery diagnostics — logs table health
   4. Start the agent HTTP server (port 8502) — blocking, keeps process alive
 
 Dev mode:
@@ -13,15 +13,15 @@ Dev mode:
     → Sets log level to DEBUG on the console; dashboard shows raw SQL/logs.
 
 Model training:
-    Trigger training manually via the '🧠 Train Model' tab in the dashboard,
-    or by asking the agent: "Train the model on data from 2025-12-25 to 2025-12-31".
+    Trigger training via the '🧠 Train Model' tab in the dashboard.
+    Training spawns a background thread inside the dashboard process and
+    writes progress to training_status.json so the UI can poll it safely.
 """
 
 import logging
 import os
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -38,8 +38,9 @@ setup_logging(dev_mode=_dev_mode)
 # 1. Dashboard subprocess
 # ---------------------------------------------------------------------------
 
+
 def start_dashboard() -> None:
-    """Launch Streamlit dashboard on port 8501 (non-blocking)."""
+    """Launch Streamlit dashboard on port 8501 (non-blocking subprocess)."""
     dashboard_path = Path(__file__).parent / "dashboard" / "app.py"
     logging.info("[MAIN] Starting Streamlit dashboard → http://localhost:8501")
     subprocess.Popen(
@@ -57,6 +58,7 @@ def start_dashboard() -> None:
 # 2. BigQuery startup diagnostics
 # ---------------------------------------------------------------------------
 
+
 def run_startup_diagnostics() -> None:
     """
     Query the pricing table and log basic health metrics.
@@ -68,12 +70,12 @@ def run_startup_diagnostics() -> None:
 
         diag = run_diagnostic_query()
 
-        total      = diag.get("total_rows", 0)
-        rule_srcs  = diag.get("distinct_rule_sources", 0)
-        countries  = diag.get("distinct_countries", 0)
-        orders     = diag.get("orders", 0)
-        earliest   = diag.get("earliest_record")
-        latest     = diag.get("latest_record")
+        total     = diag.get("total_rows", 0)
+        rule_srcs = diag.get("distinct_rule_sources", 0)
+        countries = diag.get("distinct_countries", 0)
+        orders    = diag.get("orders", 0)
+        earliest  = diag.get("earliest_record")
+        latest    = diag.get("latest_record")
 
         if total == 0:
             logging.error(
@@ -111,18 +113,18 @@ if __name__ == "__main__":
         print("  DEV MODE ON — debug logging enabled")
     print()
 
-    # 1. Start dashboard (background)
-    dashboard_thread = threading.Thread(target=start_dashboard, daemon=True)
-    dashboard_thread.start()
+    # 1. Start dashboard subprocess (non-blocking)
+    start_dashboard()
 
     # Give Streamlit a moment to bind before printing the ready message
     time.sleep(2)
+    logging.info("[MAIN] Dashboard started — open http://localhost:8501")
 
     # 2. BQ diagnostics (blocking — typically < 5 seconds)
     run_startup_diagnostics()
 
-    # 3. Start agent HTTP server — this blocks and keeps the process alive
-    logging.info("[MAIN] Open http://localhost:8501 to chat in the browser.")
+    # 3. Start agent HTTP server — blocks and keeps the process alive
+    logging.info("[MAIN] Open http://localhost:8501 to use the dashboard.")
     logging.info("[MAIN] Starting agent HTTP server on port 8502…")
 
     from agent.server import start_agent_server  # noqa: PLC0415

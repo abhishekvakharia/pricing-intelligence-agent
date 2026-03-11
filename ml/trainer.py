@@ -8,14 +8,15 @@ Steps executed by train_models():
   1. Validate row count for the given date range
   2. Clean up existing BQ view, Vertex AI models, datasets, and endpoints
   3. Create fresh BigQuery ML view with derived feature columns
-  4. Register the view as a Vertex AI Managed TabularDataset
-  5. Launch AutoML Tabular training for:
+  4. Verify the view was created and has rows
+  5. Register the view as a Vertex AI Managed TabularDataset
+  6. Launch AutoML Tabular training for:
        • Model 1  — Conversion Classifier  (target: quote_accepted)
        • Model 2  — Margin Regressor       (target: margin_pct)
-  6. Fetch model-level evaluation metrics
-  7. Deploy both models to Vertex AI Endpoints
-  8. Persist endpoint resource names to endpoints.json
-  9. Return a results dict consumed by agent/tools.py and the dashboard
+  7. Fetch model-level evaluation metrics
+  8. Deploy both models to Vertex AI Endpoints
+  9. Persist endpoint resource names to endpoints.json
+ 10. Return a results dict consumed by agent/tools.py and the dashboard
 
 Schema notes for price_fact_us:
   - No SCD columns (db_rec_del_flag, db_rec_close_date, REGION, etc.)
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from google.cloud import aiplatform, bigquery
@@ -49,6 +51,9 @@ from config import (
 
 _ML_VIEW_NAME = "pricing_ml_view"
 _ML_VIEW_FULL = f"{GCP_PROJECT_ID}.{BQ_DATASET_NAME}.{_ML_VIEW_NAME}"
+
+# Path for persisting endpoint resource names (relative to project root)
+_ENDPOINTS_FILE = Path(__file__).resolve().parents[1] / "endpoints.json"
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +127,6 @@ SELECT
     price_modifier_delta,
     customer_bump_percent,
     total_acop_delta,
-    total_margin_bump,
-    total_base_price_bump,
 
     -- Floor Rule
     engine_floor_price,
@@ -145,7 +148,6 @@ SELECT
     skip_additional_cost_flag,
     skip_bump_flag,
     skip_gpe_discount_flag,
-    floor_override_price_rule,
 
     -- Derived target and feature columns
     CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END
@@ -216,7 +218,6 @@ BOOL_COLS = [
     "skip_additional_cost_flag",
     "skip_bump_flag",
     "skip_gpe_discount_flag",
-    "floor_override_price_rule",
     "was_price_overridden",
     "hit_floor_price",
 ]
@@ -236,10 +237,46 @@ MARGIN_COLUMN_TRANSFORMATIONS: list[dict] = [
 
 
 # ---------------------------------------------------------------------------
+# Step helpers
+# ---------------------------------------------------------------------------
+
+def _step(n: int, total: int, msg: str) -> None:
+    """Log and print a numbered step banner."""
+    banner = f"[TRAINER] Step {n}/{total}: {msg}"
+    logging.info(banner)
+    print(banner)
+
+
+def _verify_view_exists(bq_client: bigquery.Client) -> int:
+    """
+    Verify the ML view was created and has rows.
+
+    Returns the row count from the view.
+
+    Raises
+    ------
+    RuntimeError
+        If the view has 0 rows (DDL succeeded but the source table returned
+        nothing — likely a bad date filter).
+    """
+    count_sql = f"SELECT COUNT(*) AS cnt FROM `{_ML_VIEW_FULL}`"
+    logging.info("[TRAINER] Verifying view: %s", count_sql)
+    rows = list(bq_client.query(count_sql).result())
+    view_cnt = rows[0]["cnt"]
+    logging.info("[TRAINER] View row count: %d", view_cnt)
+    if view_cnt == 0:
+        raise RuntimeError(
+            f"BigQuery ML view `{_ML_VIEW_FULL}` was created but contains 0 rows. "
+            "Check the date filter — the source table may have no data for this range."
+        )
+    return view_cnt
+
+
+# ---------------------------------------------------------------------------
 # Cleanup helpers — idempotent, errors are non-fatal
 # ---------------------------------------------------------------------------
 
-def cleanup_existing_resources(client: bigquery.Client) -> None:
+def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
     """
     Deletes the pricing_ml_view in BigQuery and any existing Vertex AI models,
     datasets, and endpoints with matching display names before recreating them.
@@ -248,14 +285,21 @@ def cleanup_existing_resources(client: bigquery.Client) -> None:
     """
     # ── Delete BQ view ──────────────────────────────────────────────────────
     try:
-        client.delete_table(_ML_VIEW_FULL, not_found_ok=True)
+        bq_client.delete_table(_ML_VIEW_FULL, not_found_ok=True)
         logging.info("[TRAINER] Deleted BQ view (if existed): %s", _ML_VIEW_FULL)
     except Exception as e:
         logging.warning("[TRAINER] Could not delete BQ view %s: %s", _ML_VIEW_FULL, e)
 
+    # ── Delete existing Vertex AI endpoints first (before deleting models) ───
+    for display_name in [
+        f"{CONVERSION_MODEL_DISPLAY_NAME}-endpoint",
+        f"{MARGIN_MODEL_DISPLAY_NAME}-endpoint",
+    ]:
+        _delete_endpoint_if_exists(display_name)
+
     # ── Delete existing Vertex AI models by display name ────────────────────
-    try:
-        for display_name in [CONVERSION_MODEL_DISPLAY_NAME, MARGIN_MODEL_DISPLAY_NAME]:
+    for display_name in [CONVERSION_MODEL_DISPLAY_NAME, MARGIN_MODEL_DISPLAY_NAME]:
+        try:
             existing_models = aiplatform.Model.list(
                 filter=f'display_name="{display_name}"',
                 order_by="create_time desc",
@@ -272,8 +316,8 @@ def cleanup_existing_resources(client: bigquery.Client) -> None:
                     logging.warning(
                         "[TRAINER] Could not delete model %s: %s", display_name, me
                     )
-    except Exception as e:
-        logging.warning("[TRAINER] Vertex AI model cleanup failed (non-fatal): %s", e)
+        except Exception as e:
+            logging.warning("[TRAINER] Vertex AI model cleanup failed (non-fatal): %s", e)
 
     # ── Delete existing Vertex AI datasets by display name ──────────────────
     try:
@@ -327,19 +371,25 @@ def _delete_endpoint_if_exists(display_name: str) -> None:
 # Main training function
 # ---------------------------------------------------------------------------
 
+_TOTAL_STEPS = 10
+
+
 def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     """
     Run the full Vertex AI AutoML Tabular training pipeline for a date range.
 
-    1. Validate that records exist for the given date range
-    2. Clean up existing BQ view and Vertex AI models / datasets / endpoints
-    3. Create fresh BigQuery ML view (filtered to date range)
-    4. Register view as a Vertex AI Managed TabularDataset
-    5. Train conversion classifier (quote_accepted)
-    6. Train margin regressor (margin_pct)
-    7. Fetch evaluation metrics from Vertex AI
-    8. Deploy both models to Vertex AI Endpoints
-    9. Persist endpoint resource names to endpoints.json
+    Steps
+    -----
+    1.  Validate that source table has rows for the date range
+    2.  Initialise Vertex AI SDK
+    3.  Clean up existing BQ view and Vertex AI resources
+    4.  Create fresh BigQuery ML view
+    5.  Verify view has rows
+    6.  Register view as a Vertex AI Managed TabularDataset
+    7.  Train conversion classifier (quote_accepted)
+    8.  Train margin regressor (margin_pct)
+    9.  Fetch evaluation metrics
+    10. Deploy both models and save endpoints.json
 
     Parameters
     ----------
@@ -351,76 +401,94 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     Returns
     -------
     dict
-        conversion_auc, conversion_log_loss,
-        margin_rmse, margin_r2, margin_mae,
-        conversion_endpoint (resource name),
-        margin_endpoint (resource name)
+        Keys: conversion_auc, conversion_log_loss,
+              margin_rmse, margin_r2, margin_mae,
+              conversion_endpoint, margin_endpoint
 
     Raises
     ------
     ValueError
-        If no records are found for the specified date range.
+        If no records found in the source table for the given date range.
+    RuntimeError
+        If the BQ view is created but contains 0 rows, or if a Vertex job
+        reports errors after completing.
+    Exception
+        Re-raised from Vertex AI SDK on training/deployment failures.
     """
-    logging.info("[TRAINER] Training on date range: %s → %s", date_from, date_to)
+    logging.info(
+        "[TRAINER] ===== Training pipeline START  %s → %s =====",
+        date_from, date_to,
+    )
 
     bq_client = bigquery.Client(project=GCP_PROJECT_ID)
 
-    # ---- Step 1: Validate row count ----------------------------------------
+    # ── Step 1: Validate source row count ────────────────────────────────────
+    _step(1, _TOTAL_STEPS, f"Validating source row count for {date_from} → {date_to}")
     count_sql = f"""
         SELECT COUNT(*) AS cnt
         FROM `{BQ_FULL_TABLE}`
         WHERE created >= TIMESTAMP('{date_from}')
           AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
     """
-    logging.info("[TRAINER] Row count query:\n%s", count_sql)
-    count_row = list(bq_client.query(count_sql).result())[0]
-    row_count = count_row["cnt"]
-    logging.info("[TRAINER] Rows found: %d", row_count)
+    logging.info("[TRAINER] Row count SQL:\n%s", count_sql)
+    count_job = bq_client.query(count_sql)
+    count_rows = list(count_job.result())  # blocks until complete
+    if count_job.errors:
+        raise RuntimeError(
+            f"Row count query failed with errors: {count_job.errors}"
+        )
+    row_count = count_rows[0]["cnt"]
+    logging.info("[TRAINER] Source rows in range: %d", row_count)
+    print(f"  Source rows found: {row_count:,}")
     if row_count == 0:
         raise ValueError(
             f"No records found in `{BQ_FULL_TABLE}` "
             f"for the date range {date_from} → {date_to}. "
             "Adjust the date range before training."
         )
-    print(f"Row count for {date_from} → {date_to}: {row_count:,}")
 
-    # ---- Step 2: Clean up existing resources --------------------------------
-    logging.info(
-        "[TRAINER] Cleaning up existing BQ view and Vertex AI models/datasets/endpoints…"
-    )
-    # Initialise Vertex AI SDK first so cleanup calls work
-    print(
-        f"Initialising Vertex AI (project={GCP_PROJECT_ID}, region={VERTEX_REGION}) …"
-    )
+    # ── Step 2: Initialise Vertex AI SDK ─────────────────────────────────────
+    _step(2, _TOTAL_STEPS, f"Initialising Vertex AI (project={GCP_PROJECT_ID}, region={VERTEX_REGION})")
     aiplatform.init(
         project=GCP_PROJECT_ID,
         location=VERTEX_REGION,
         staging_bucket=VERTEX_STAGING_BUCKET,
     )
+    logging.info("[TRAINER] Vertex AI SDK initialised")
 
+    # ── Step 3: Cleanup existing resources ────────────────────────────────────
+    _step(3, _TOTAL_STEPS, "Cleaning up existing BQ view and Vertex AI resources")
     cleanup_existing_resources(bq_client)
 
-    # ---- Step 3: Create fresh BigQuery ML view ------------------------------
-    print(
-        f"Creating BigQuery ML view `{_ML_VIEW_FULL}` "
-        f"(dates: {date_from} → {date_to}) …"
-    )
+    # ── Step 4: Create BigQuery ML view ───────────────────────────────────────
+    _step(4, _TOTAL_STEPS, f"Creating BigQuery ML view `{_ML_VIEW_FULL}`")
     view_sql = build_ml_view_sql(date_from, date_to)
-    logging.info("[TRAINER] Creating pricing_ml_view…")
-    bq_client.query(view_sql).result()
-    logging.info("[TRAINER] pricing_ml_view created successfully")
-    print("  View created successfully.")
+    logging.info("[TRAINER] ML view DDL:\n%s", view_sql)
+    view_job = bq_client.query(view_sql)
+    view_job.result()  # blocks until complete
+    if view_job.errors:
+        raise RuntimeError(
+            f"ML view DDL failed with BigQuery errors: {view_job.errors}"
+        )
+    logging.info("[TRAINER] ML view created: %s", _ML_VIEW_FULL)
+    print(f"  View created: {_ML_VIEW_FULL}")
 
-    # ---- Step 4: Register Vertex AI Managed TabularDataset -----------------
-    print("Registering Vertex AI Managed Dataset from BigQuery view …")
+    # ── Step 5: Verify view has rows ─────────────────────────────────────────
+    _step(5, _TOTAL_STEPS, "Verifying ML view row count")
+    view_row_count = _verify_view_exists(bq_client)
+    print(f"  View rows: {view_row_count:,}")
+
+    # ── Step 6: Register Vertex AI Managed TabularDataset ────────────────────
+    _step(6, _TOTAL_STEPS, "Registering Vertex AI Managed TabularDataset")
     dataset = aiplatform.TabularDataset.create(
         display_name="pricing-ml-dataset",
         bq_source=f"bq://{_ML_VIEW_FULL}",
     )
-    print(f"  Dataset resource: {dataset.resource_name}")
+    logging.info("[TRAINER] Dataset registered: %s", dataset.resource_name)
+    print(f"  Dataset: {dataset.resource_name}")
 
-    # ---- Step 5: Train conversion classifier --------------------------------
-    print(f"Launching AutoML training job: {CONVERSION_MODEL_DISPLAY_NAME} …")
+    # ── Step 7: Train conversion classifier ──────────────────────────────────
+    _step(7, _TOTAL_STEPS, f"Training conversion classifier: {CONVERSION_MODEL_DISPLAY_NAME}")
     conversion_job = AutoMLTabularTrainingJob(
         display_name=CONVERSION_MODEL_DISPLAY_NAME,
         optimization_prediction_type="classification",
@@ -432,12 +500,21 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         target_column="quote_accepted",
         budget_milli_node_hours=1000,
         model_display_name=CONVERSION_MODEL_DISPLAY_NAME,
-        sync=True,
+        sync=True,  # block until job finishes — surface any errors immediately
     )
-    print(f"  Conversion model resource: {model_conversion.resource_name}")
+    if conversion_job.has_failed:
+        raise RuntimeError(
+            f"Conversion classifier training failed. "
+            f"State: {conversion_job.state}. "
+            f"Check Vertex AI console for pipeline details."
+        )
+    logging.info(
+        "[TRAINER] Conversion model trained: %s", model_conversion.resource_name
+    )
+    print(f"  Conversion model: {model_conversion.resource_name}")
 
-    # ---- Step 6: Train margin regressor -------------------------------------
-    print(f"Launching AutoML training job: {MARGIN_MODEL_DISPLAY_NAME} …")
+    # ── Step 8: Train margin regressor ───────────────────────────────────────
+    _step(8, _TOTAL_STEPS, f"Training margin regressor: {MARGIN_MODEL_DISPLAY_NAME}")
     margin_job = AutoMLTabularTrainingJob(
         display_name=MARGIN_MODEL_DISPLAY_NAME,
         optimization_prediction_type="regression",
@@ -449,19 +526,46 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         target_column="margin_pct",
         budget_milli_node_hours=1000,
         model_display_name=MARGIN_MODEL_DISPLAY_NAME,
-        sync=True,
+        sync=True,  # block until job finishes — surface any errors immediately
     )
-    print(f"  Margin model resource: {model_margin.resource_name}")
+    if margin_job.has_failed:
+        raise RuntimeError(
+            f"Margin regressor training failed. "
+            f"State: {margin_job.state}. "
+            f"Check Vertex AI console for pipeline details."
+        )
+    logging.info(
+        "[TRAINER] Margin model trained: %s", model_margin.resource_name
+    )
+    print(f"  Margin model: {model_margin.resource_name}")
 
-    # ---- Step 7: Fetch evaluation metrics -----------------------------------
-    print("Fetching model evaluation metrics …")
+    # ── Step 9: Fetch evaluation metrics ─────────────────────────────────────
+    _step(9, _TOTAL_STEPS, "Fetching evaluation metrics from Vertex AI")
 
     conv_evaluations = model_conversion.list_model_evaluations()
-    conv_metrics: dict = conv_evaluations[0].metrics if conv_evaluations else {}
+    conv_metrics: dict = {}
+    if conv_evaluations:
+        conv_metrics = dict(conv_evaluations[0].metrics)
+    else:
+        logging.warning("[TRAINER] No evaluation metrics returned for conversion model")
 
     margin_evaluations = model_margin.list_model_evaluations()
-    margin_metrics: dict = margin_evaluations[0].metrics if margin_evaluations else {}
+    margin_metrics: dict = {}
+    if margin_evaluations:
+        margin_metrics = dict(margin_evaluations[0].metrics)
+    else:
+        logging.warning("[TRAINER] No evaluation metrics returned for margin model")
 
+    logging.info(
+        "[TRAINER] Conversion metrics — AUC: %s  LogLoss: %s",
+        conv_metrics.get("auRoc"), conv_metrics.get("logLoss"),
+    )
+    logging.info(
+        "[TRAINER] Margin metrics — RMSE: %s  R²: %s  MAE: %s",
+        margin_metrics.get("rootMeanSquaredError"),
+        margin_metrics.get("rSquared"),
+        margin_metrics.get("meanAbsoluteError"),
+    )
     print(
         f"  Conversion — AUC: {conv_metrics.get('auRoc')}  "
         f"LogLoss: {conv_metrics.get('logLoss')}"
@@ -472,9 +576,11 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         f"MAE: {margin_metrics.get('meanAbsoluteError')}"
     )
 
-    # ---- Step 8: Deploy both models to Vertex AI Endpoints -----------------
+    # ── Step 10: Deploy both models + save endpoints.json ────────────────────
+    _step(10, _TOTAL_STEPS, "Deploying models to Vertex AI Endpoints")
+
     conv_endpoint_display_name = f"{CONVERSION_MODEL_DISPLAY_NAME}-endpoint"
-    print(f"Deploying conversion model to Vertex AI Endpoint ({conv_endpoint_display_name}) …")
+    logging.info("[TRAINER] Deploying conversion model → %s", conv_endpoint_display_name)
     _delete_endpoint_if_exists(conv_endpoint_display_name)
     conv_endpoint = model_conversion.deploy(
         deployed_model_display_name=conv_endpoint_display_name,
@@ -483,10 +589,11 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         max_replica_count=2,
         sync=True,
     )
+    logging.info("[TRAINER] Conversion endpoint: %s", conv_endpoint.resource_name)
     print(f"  Conversion endpoint: {conv_endpoint.resource_name}")
 
     margin_endpoint_display_name = f"{MARGIN_MODEL_DISPLAY_NAME}-endpoint"
-    print(f"Deploying margin model to Vertex AI Endpoint ({margin_endpoint_display_name}) …")
+    logging.info("[TRAINER] Deploying margin model → %s", margin_endpoint_display_name)
     _delete_endpoint_if_exists(margin_endpoint_display_name)
     margin_endpoint = model_margin.deploy(
         deployed_model_display_name=margin_endpoint_display_name,
@@ -495,19 +602,19 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         max_replica_count=2,
         sync=True,
     )
+    logging.info("[TRAINER] Margin endpoint: %s", margin_endpoint.resource_name)
     print(f"  Margin endpoint: {margin_endpoint.resource_name}")
 
-    # ---- Step 9: Persist endpoint resource names ---------------------------
+    # Persist endpoint resource names to disk
     endpoints_payload = {
         "conversion_endpoint": conv_endpoint.resource_name,
         "margin_endpoint":     margin_endpoint.resource_name,
     }
-    with open("endpoints.json", "w") as fh:
-        json.dump(endpoints_payload, fh, indent=2)
-    print("Endpoint resource names saved to endpoints.json")
+    _ENDPOINTS_FILE.write_text(json.dumps(endpoints_payload, indent=2))
+    logging.info("[TRAINER] Endpoints saved to %s", _ENDPOINTS_FILE)
+    print(f"  Endpoints written to {_ENDPOINTS_FILE}")
 
-    # ---- Return results dict -----------------------------------------------
-    return {
+    results = {
         "conversion_auc":      conv_metrics.get("auRoc"),
         "conversion_log_loss": conv_metrics.get("logLoss"),
         "margin_rmse":         margin_metrics.get("rootMeanSquaredError"),
@@ -516,3 +623,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         "conversion_endpoint": conv_endpoint.resource_name,
         "margin_endpoint":     margin_endpoint.resource_name,
     }
+    logging.info(
+        "[TRAINER] ===== Training pipeline COMPLETE  results=%s =====", results
+    )
+    return results

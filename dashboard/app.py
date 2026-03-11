@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -59,32 +61,104 @@ st.set_page_config(
 # HTTP bridge — calls the agent server started by main.py
 # ---------------------------------------------------------------------------
 
-AGENT_SERVER_URL = "http://localhost:8502/chat"
+AGENT_SERVER_URL = "http://localhost:8502"
 
 
 def call_agent(message: str) -> tuple[str, dict]:
     """POST a user message to the agent HTTP server and return (response, metadata)."""
     try:
         resp = requests.post(
-            AGENT_SERVER_URL,
+            f"{AGENT_SERVER_URL}/chat",
             json={"message": message},
-            timeout=120,
+            timeout=180,
+            headers={"Content-Type": "application/json"},
         )
         resp.raise_for_status()
         data = resp.json()
         return data.get("response", "No response from agent."), data.get("metadata", {})
     except requests.exceptions.ConnectionError:
         return (
-            "⚠️ Agent server is not reachable. Make sure **main.py** is running.",
-            {"error": "Connection refused on port 8502"},
+            "⚠️ Agent server is not reachable. Make sure `main.py` is running.",
+            {"error": "Connection refused to http://localhost:8502"},
         )
     except requests.exceptions.Timeout:
         return (
-            "⚠️ The agent took too long to respond (> 120 s). Try again.",
+            "⏱️ Agent timed out (>3 min). The query may be too large — try a narrower date range.",
             {"error": "Request timeout"},
         )
+    except requests.exceptions.HTTPError as exc:
+        return (
+            f"⚠️ Agent returned error {exc.response.status_code}: {exc.response.text}",
+            {"error": str(exc)},
+        )
     except Exception as exc:
-        return f"⚠️ Error contacting agent: {exc}", {"error": str(exc)}
+        return f"Unexpected error: {exc}", {"error": str(exc)}
+
+
+def check_agent_health() -> bool:
+    """Returns True if the agent server is reachable and healthy."""
+    try:
+        resp = requests.get(f"{AGENT_SERVER_URL}/health", timeout=3)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Training status helpers  (file-based so threads can share state with UI)
+# ---------------------------------------------------------------------------
+
+TRAINING_STATUS_FILE = _ROOT / "training_status.json"
+
+
+def read_training_status() -> dict:
+    """Read training status from disk; returns {} if the file is absent."""
+    try:
+        if TRAINING_STATUS_FILE.exists():
+            return json.loads(TRAINING_STATUS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def write_training_status(status: str, **kwargs) -> None:
+    """Write training status dict to disk so the UI thread can poll it."""
+    payload = {
+        "status": status,
+        "updated_at": datetime.utcnow().isoformat(),
+        **kwargs,
+    }
+    try:
+        TRAINING_STATUS_FILE.write_text(json.dumps(payload))
+    except Exception as exc:
+        logging.warning("[DASHBOARD] Could not write training status: %s", exc)
+
+
+def _run_training(date_from_str: str, date_to_str: str) -> None:
+    """
+    Background-thread wrapper: runs train_models() and writes status file at
+    each stage so the Streamlit UI can poll it without session_state.
+    """
+    write_training_status("running", date_from=date_from_str, date_to=date_to_str)
+    try:
+        from ml.trainer import train_models  # noqa: PLC0415
+
+        results = train_models(date_from_str, date_to_str)
+        write_training_status(
+            "complete",
+            date_from=date_from_str,
+            date_to=date_to_str,
+            results=results,
+        )
+        logging.info("[DASHBOARD] Training complete: %s", results)
+    except Exception as exc:
+        write_training_status(
+            "failed",
+            date_from=date_from_str,
+            date_to=date_to_str,
+            error=str(exc),
+        )
+        logging.error("[DASHBOARD] Training failed: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -119,15 +193,14 @@ if dev_mode:
 
     # BQ diagnostics
     st.sidebar.subheader("🔍 BQ Diagnostics")
-    try:
-        from bq.queries import _diag_cache, _active_filter_cache  # noqa: PLC0415
-        if _diag_cache:
-            st.sidebar.json(_diag_cache)
-            st.sidebar.code(_active_filter_cache or "(not yet resolved)", language="sql")
-        else:
-            st.sidebar.info("Diagnostics not run yet. Start a chat to trigger.")
-    except Exception as diag_exc:
-        st.sidebar.error(f"Could not load diagnostics: {diag_exc}")
+    if st.sidebar.button("Run BQ Diagnostics", use_container_width=True):
+        try:
+            from bq.queries import run_diagnostic_query  # noqa: PLC0415
+            diag_result = run_diagnostic_query()
+            st.sidebar.json(diag_result)
+            st.sidebar.code("1=1  (no SCD filter — all rows active)", language="sql")
+        except Exception as diag_exc:
+            st.sidebar.error(f"Could not run diagnostics: {diag_exc}")
 
 st.sidebar.markdown("---")
 
@@ -209,6 +282,16 @@ with tabs[0]:
         "Type a question below — the agent will query BigQuery, run analysis, "
         "and update the other dashboard tabs automatically."
     )
+
+    # Agent health banner
+    _agent_ok = check_agent_health()
+    if _agent_ok:
+        st.success("🟢 Agent server is online (localhost:8502)", icon="✅")
+    else:
+        st.error(
+            "🔴 Agent server is **offline** — start `main.py` to enable chat.",
+            icon="🚨",
+        )
 
     # Initialise session-state for chat history
     if "chat_history" not in st.session_state:
@@ -726,17 +809,31 @@ with tabs[7]:
         "Estimated cost: **~$20–30 per run**."
     )
 
-    # ---- Date pickers ---------------------------------------------------------
+    # ---- Read current training status from disk ------------------------------
+    _ts = read_training_status()
+    _status = _ts.get("status")  # "running" | "complete" | "failed" | None
+
+    # Auto-refresh the page every 15 s while training is in progress
+    if _status == "running":
+        st.markdown(
+            '<meta http-equiv="refresh" content="15">',
+            unsafe_allow_html=True,
+        )
+
+    # ---- Date pickers (disabled while training is in progress) ---------------
     st.subheader("1. Select Training Date Range")
     col_from, col_to = st.columns(2)
     default_from = date(2025, 12, 25)
     default_to   = date(2025, 12, 31)
+
+    _picker_disabled = (_status == "running")
 
     with col_from:
         date_from = st.date_input(
             "Training data from",
             value=default_from,
             help="Lower bound on the `created` column (inclusive).",
+            disabled=_picker_disabled,
         )
     with col_to:
         date_to = st.date_input(
@@ -744,6 +841,7 @@ with tabs[7]:
             value=default_to,
             min_value=date_from,
             help="Upper bound on the `created` column (inclusive).",
+            disabled=_picker_disabled,
         )
 
     date_from_str = str(date_from)
@@ -751,7 +849,11 @@ with tabs[7]:
 
     # ---- Row count preview ---------------------------------------------------
     st.subheader("2. Preview Record Count")
-    if st.button("🔍 Count Records in Date Range", use_container_width=False):
+    if st.button(
+        "🔍 Count Records in Date Range",
+        use_container_width=False,
+        disabled=_picker_disabled,
+    ):
         with st.spinner("Querying BigQuery for row count…"):
             try:
                 from google.cloud import bigquery as _bq  # noqa: PLC0415
@@ -818,63 +920,46 @@ with tabs[7]:
         "I understand the cost and want to start training",
         value=False,
         key="training_confirmed",
+        disabled=_picker_disabled,
     )
 
-    start_disabled = not confirmed
+    # Button disabled while training is in progress OR checkbox not ticked
+    _btn_disabled = _picker_disabled or not confirmed
 
     if st.button(
         f"🚀 Start Training  ({date_from_str} → {date_to_str})",
         type="primary",
-        disabled=start_disabled,
+        disabled=_btn_disabled,
         use_container_width=True,
     ):
-        # Kick off training in a background thread so the UI stays responsive
-        if "training_status" not in st.session_state or \
-                st.session_state.get("training_status") != "running":
+        # Write "running" to disk immediately so the button disables on rerun
+        write_training_status("running", date_from=date_from_str, date_to=date_to_str)
 
-            st.session_state["training_status"]  = "running"
-            st.session_state["training_error"]   = None
-            st.session_state["training_results"] = None
-            st.session_state["training_dates"]   = (date_from_str, date_to_str)
+        _t = threading.Thread(
+            target=_run_training,
+            args=(date_from_str, date_to_str),
+            daemon=True,
+        )
+        _t.start()
+        st.rerun()
 
-            def _run_training(df_str: str, dt_str: str) -> None:
-                try:
-                    from ml.trainer import train_models  # noqa: PLC0415
-                    results = train_models(df_str, dt_str)
-                    st.session_state["training_results"] = results
-                    st.session_state["training_status"]  = "complete"
-                    logging.info("[DASHBOARD] Training complete: %s", results)
-                except Exception as _exc:
-                    st.session_state["training_error"]  = str(_exc)
-                    st.session_state["training_status"] = "failed"
-                    logging.error("[DASHBOARD] Training failed: %s", _exc, exc_info=True)
-
-            _t = threading.Thread(
-                target=_run_training,
-                args=(date_from_str, date_to_str),
-                daemon=True,
-            )
-            _t.start()
-            st.rerun()
-        else:
-            st.info("Training is already running. Check the status below.")
-
-    # ---- Training status panel -----------------------------------------------
-    _status = st.session_state.get("training_status")
-
+    # ---- Training status panel (polled from disk) ----------------------------
     if _status == "running":
-        _d = st.session_state.get("training_dates", ("?", "?"))
+        _d_from = _ts.get("date_from", "?")
+        _d_to   = _ts.get("date_to", "?")
+        _updated = _ts.get("updated_at", "")
         st.info(
-            f"⏳ **Training in progress** for records from **{_d[0]}** to **{_d[1]}**.\n\n"
+            f"⏳ **Training in progress** for records from **{_d_from}** to **{_d_to}**.\n\n"
+            f"Last updated: {_updated[:19].replace('T', ' ')} UTC\n\n"
             "Training runs on Vertex AI and typically takes 1–3 hours. "
-            "You can safely navigate to other dashboard tabs while waiting. "
-            "Refresh this tab periodically to check progress.",
+            "This page auto-refreshes every 15 seconds. "
+            "You can safely navigate to other dashboard tabs while waiting.",
             icon="⏳",
         )
 
     elif _status == "complete":
         st.success("✅ **Training complete!** Models have been deployed to Vertex AI.")
-        _results = st.session_state.get("training_results", {})
+        _results = _ts.get("results", {})
         if _results:
             st.subheader("Model Evaluation Metrics")
             c1, c2, c3 = st.columns(3)
@@ -893,11 +978,25 @@ with tabs[7]:
                 "Endpoint resource names saved to `endpoints.json`. "
                 "View full metrics in the **🤖 ML Model Results** tab."
             )
+        # Allow re-training by clearing the status file
+        if st.button("🔁 Train Again", use_container_width=False):
+            try:
+                TRAINING_STATUS_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.rerun()
 
     elif _status == "failed":
-        _err = st.session_state.get("training_error", "Unknown error")
+        _err = _ts.get("error", "Unknown error")
         st.error(f"❌ **Training failed:** {_err}")
         st.caption(
             "Check `agent_session.log` for full traceback details, or enable "
             "**Dev Mode** in the sidebar to view live logs."
         )
+        # Allow retry
+        if st.button("🔁 Retry Training", use_container_width=False):
+            try:
+                TRAINING_STATUS_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            st.rerun()
