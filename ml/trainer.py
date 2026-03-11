@@ -25,6 +25,8 @@ from typing import Any
 from google.cloud import aiplatform, bigquery
 from google.cloud.aiplatform import AutoMLTabularTrainingJob
 
+from bq.queries import get_active_filter
+
 from config import (
     GCP_PROJECT_ID,
     BQ_DATASET_NAME,
@@ -44,7 +46,34 @@ from config import (
 _ML_VIEW_NAME = "pricing_ml_view"
 _ML_VIEW_FULL = f"{GCP_PROJECT_ID}.{BQ_DATASET_NAME}.{_ML_VIEW_NAME}"
 
-CREATE_VIEW_SQL = f"""
+
+def build_ml_view_sql(
+    date_from: str = "2025-12-25",
+    date_to: str = "2025-12-31",
+) -> str:
+    """
+    Build the CREATE OR REPLACE VIEW DDL for the Vertex AI training dataset.
+
+    The view uses the adaptive active-record filter (same as bq/queries.py)
+    and filters rows using TIMESTAMP-safe casting so that BigQuery TIMESTAMP
+    columns are compared correctly.  ``date_to`` is made fully inclusive via
+    ``TIMESTAMP_ADD(... INTERVAL 1 DAY)``, capturing all records through
+    23:59:59 UTC on that day.
+
+    Parameters
+    ----------
+    date_from : str
+        Lower bound date string (YYYY-MM-DD). Default: ``'2025-12-25'``.
+    date_to : str
+        Upper bound date string (YYYY-MM-DD). Default: ``'2025-12-31'``.
+
+    Returns
+    -------
+    str
+        A complete CREATE OR REPLACE VIEW SQL statement.
+    """
+    active_filter = get_active_filter()
+    return f"""
 CREATE OR REPLACE VIEW `{_ML_VIEW_FULL}` AS
 SELECT
     sku_number,
@@ -87,8 +116,9 @@ SELECT
     CASE WHEN calculated_price = engine_floor_price THEN 1 ELSE 0 END
         AS hit_floor_price
 FROM `{BQ_FULL_TABLE}`
-WHERE db_rec_del_flag != 'Y'
-  AND db_rec_close_date IS NULL
+WHERE {active_filter}
+  AND created >= TIMESTAMP('{date_from}')
+  AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
 """
 
 # ---------------------------------------------------------------------------
@@ -149,18 +179,31 @@ MARGIN_COLUMN_TRANSFORMATIONS: list[dict] = [
 # Main training function
 # ---------------------------------------------------------------------------
 
-def train_models() -> dict[str, Any]:
+def train_models(
+    date_from: str = "2025-12-25",
+    date_to: str = "2025-12-31",
+) -> dict[str, Any]:
     """
-    Run the full Vertex AI AutoML Tabular training pipeline.
+    Run the full Vertex AI AutoML Tabular training pipeline for a date range.
 
-    1. Initialise Vertex AI SDK
-    2. Create/replace BigQuery ML view
-    3. Register view as a Vertex AI Managed TabularDataset
-    4. Train conversion classifier (quote_accepted)
-    5. Train margin regressor (margin_pct)
-    6. Fetch evaluation metrics from Vertex AI
-    7. Deploy both models to Vertex AI Endpoints
-    8. Persist endpoint resource names to endpoints.json
+    1. Validate that records exist for the given date range
+    2. Initialise Vertex AI SDK
+    3. Create/replace BigQuery ML view (filtered to date range)
+    4. Register view as a Vertex AI Managed TabularDataset
+    5. Train conversion classifier (quote_accepted)
+    6. Train margin regressor (margin_pct)
+    7. Fetch evaluation metrics from Vertex AI
+    8. Deploy both models to Vertex AI Endpoints
+    9. Persist endpoint resource names to endpoints.json
+
+    Parameters
+    ----------
+    date_from : str
+        Lower bound for training data (YYYY-MM-DD), inclusive.
+        Default: ``'2025-12-25'``.
+    date_to : str
+        Upper bound for training data (YYYY-MM-DD), inclusive.
+        Default: ``'2025-12-31'``.
 
     Returns
     -------
@@ -169,7 +212,40 @@ def train_models() -> dict[str, Any]:
         margin_rmse, margin_r2, margin_mae,
         conversion_endpoint (resource name),
         margin_endpoint (resource name)
+
+    Raises
+    ------
+    ValueError
+        If no records are found for the specified date range.
     """
+    import logging  # noqa: PLC0415
+
+    # ---- Step 0: Pre-validate row count (TIMESTAMP-safe) -------------------
+    logging.info(
+        "[TRAINER] Validating row count for %s → %s …", date_from, date_to
+    )
+    bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+    active_filter = get_active_filter()
+    count_sql = f"""
+        SELECT COUNT(*) AS cnt
+        FROM `{BQ_FULL_TABLE}`
+        WHERE {active_filter}
+          AND created >= TIMESTAMP('{date_from}')
+          AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
+    """
+    logging.info("[TRAINER] Row count query:\n%s", count_sql)
+    row_count = list(bq_client.query(count_sql).result())[0]["cnt"]
+    logging.info(
+        "[TRAINER] Rows found for range %s → %s: %d", date_from, date_to, row_count
+    )
+    if row_count == 0:
+        raise ValueError(
+            f"No records found in `{BQ_FULL_TABLE}` "
+            f"for the date range {date_from} → {date_to}. "
+            "Widen the date range or check the `created` column in your table."
+        )
+    print(f"Row count for {date_from} → {date_to}: {row_count:,}")
+
     # ---- Step 1: Initialise Vertex AI SDK ----------------------------------
     print(f"Initialising Vertex AI (project={GCP_PROJECT_ID}, region={VERTEX_REGION}) …")
     aiplatform.init(
@@ -179,9 +255,9 @@ def train_models() -> dict[str, Any]:
     )
 
     # ---- Step 2: Create BigQuery ML view -----------------------------------
-    print(f"Creating BigQuery ML view `{_ML_VIEW_FULL}` …")
-    bq_client = bigquery.Client(project=GCP_PROJECT_ID)
-    bq_client.query(CREATE_VIEW_SQL).result()
+    print(f"Creating BigQuery ML view `{_ML_VIEW_FULL}` (dates: {date_from} → {date_to}) …")
+    view_sql = build_ml_view_sql(date_from, date_to)
+    bq_client.query(view_sql).result()
     print("  View created successfully.")
 
     # ---- Step 3: Register Vertex AI Managed TabularDataset -----------------
