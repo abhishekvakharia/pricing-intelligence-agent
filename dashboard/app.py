@@ -679,11 +679,35 @@ with tabs[4]:
 
 with tabs[5]:
     st.header("ML Model Training Results")
-    st.caption("Powered by Vertex AI AutoML Tabular — model-level evaluation metrics only.")
+    st.caption("Powered by Vertex AI AutoML Tabular -- model-level evaluation metrics only.")
+
+    # Show active model source (default pre-trained or user-trained)
+    try:
+        from ml.trainer import get_active_endpoints  # noqa: PLC0415
+        _active = get_active_endpoints()
+        if _active.get("source") == "default":
+            st.info(
+                "**Using default pre-trained model** (price_fact_dataset baseline). "
+                "Train a new model in the **Train Model** tab to replace it.",
+                icon="ℹ️",
+            )
+        else:
+            st.success("**Using your trained model** from a completed training run.", icon="✅")
+        _active_margin = _active.get("margin_endpoint", "")
+        _active_conv   = _active.get("conversion_endpoint", "")
+    except Exception:
+        _active_margin = ""
+        _active_conv   = ""
+
     model_results: dict | None = state.get("model_results")
 
     if model_results is None:
-        _empty_state("Run model training")
+        st.markdown("#### Active Model Resources")
+        _col1, _col2 = st.columns(2)
+        _col1.text_input("Margin Model",      value=_active_margin or "(default)", disabled=True)
+        _col2.text_input("Conversion Model",  value=_active_conv   or "N/A",       disabled=True)
+        st.markdown("---")
+        _empty_state("Run model training to see evaluation metrics")
     else:
         # ---- Conversion Classifier metrics ---------------------------------
         st.subheader("Conversion Classifier  (target: quote_accepted)")
@@ -879,17 +903,24 @@ with tabs[7]:
                 st.success(f"✅ **{_rc:,} records** available for training.")
 
     # ---- Existing endpoints display ------------------------------------------
-    endpoints_path = _ROOT / "endpoints.json"
-    if endpoints_path.exists():
-        try:
-            _ep = json.loads(endpoints_path.read_text())
+    try:
+        from ml.trainer import get_active_endpoints  # noqa: PLC0415
+        _active_ep = get_active_endpoints()
+        if _active_ep.get("source") == "default":
             st.info(
-                f"**Existing deployed endpoints detected** — training will redeploy:\n\n"
-                f"- Conversion: `{_ep.get('conversion_endpoint', 'N/A')}`\n"
-                f"- Margin: `{_ep.get('margin_endpoint', 'N/A')}`"
+                "**No user-trained model yet.** The system is currently using the "
+                "default pre-trained baseline model. Training will replace it once complete."
             )
-        except Exception:
-            pass
+        else:
+            _ep_margin = _active_ep.get("margin_endpoint", "N/A")
+            _ep_conv   = _active_ep.get("conversion_endpoint", "N/A")
+            st.info(
+                f"**User-trained model active** -- training will redeploy and replace it:\n\n"
+                f"- Conversion: `{_ep_conv}`\n"
+                f"- Margin: `{_ep_margin}`"
+            )
+    except Exception:
+        pass
 
     # ---- Dev mode SQL preview ------------------------------------------------
     if dev_mode:

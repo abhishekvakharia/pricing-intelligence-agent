@@ -43,6 +43,8 @@ from config import (
     VERTEX_STAGING_BUCKET,
     CONVERSION_MODEL_DISPLAY_NAME,
     MARGIN_MODEL_DISPLAY_NAME,
+    DEFAULT_MARGIN_MODEL_RESOURCE,
+    DEFAULT_CONVERSION_MODEL_RESOURCE,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,35 @@ _ML_VIEW_FULL = f"{GCP_PROJECT_ID}.{BQ_DATASET_NAME}.{_ML_VIEW_NAME}"
 
 # Path for persisting endpoint resource names (relative to project root)
 _ENDPOINTS_FILE = Path(__file__).resolve().parents[1] / "endpoints.json"
+
+
+def get_active_endpoints() -> dict:
+    """
+    Return the active model/endpoint resource names.
+
+    Priority:
+      1. endpoints.json written by a completed training run (user-trained model)
+      2. DEFAULT_*_MODEL_RESOURCE values from config (pre-trained baseline)
+
+    Returns a dict with keys:
+      margin_endpoint     -- resource name of the margin model or endpoint
+      conversion_endpoint -- resource name of the conversion model/endpoint (may be None)
+      source              -- "user_trained" | "default"
+    """
+    if _ENDPOINTS_FILE.exists():
+        try:
+            data = json.loads(_ENDPOINTS_FILE.read_text(encoding="utf-8"))
+            if data.get("margin_endpoint"):
+                data["source"] = "user_trained"
+                return data
+        except Exception:
+            pass
+    # Fall back to pre-trained defaults
+    return {
+        "margin_endpoint":     DEFAULT_MARGIN_MODEL_RESOURCE,
+        "conversion_endpoint": DEFAULT_CONVERSION_MODEL_RESOURCE,
+        "source":              "default",
+    }
 
 # Shared training-status file (same file the dashboard polls)
 _TRAINING_STATUS_FILE = Path(__file__).resolve().parents[1] / "training_status.json"
