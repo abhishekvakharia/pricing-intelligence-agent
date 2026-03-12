@@ -7,3 +7,7 @@ __pycache__/
 venv/
 .env
 .DS_Store
+agent_session.log
+training_status.json
+training.lock
+nul

@@ -115,7 +115,7 @@ def read_training_status() -> dict:
     """Read training status from disk; returns {} if the file is absent."""
     try:
         if TRAINING_STATUS_FILE.exists():
-            return json.loads(TRAINING_STATUS_FILE.read_text())
+            return json.loads(TRAINING_STATUS_FILE.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {}
@@ -129,7 +129,7 @@ def write_training_status(status: str, **kwargs) -> None:
         **kwargs,
     }
     try:
-        TRAINING_STATUS_FILE.write_text(json.dumps(payload))
+        TRAINING_STATUS_FILE.write_text(json.dumps(payload), encoding="utf-8")
     except Exception as exc:
         logging.warning("[DASHBOARD] Could not write training status: %s", exc)
 
@@ -139,6 +139,7 @@ def _run_training(date_from_str: str, date_to_str: str) -> None:
     Background-thread wrapper: runs train_models() and writes status file at
     each stage so the Streamlit UI can poll it without session_state.
     """
+    from ml.trainer import _release_training_lock  # noqa: PLC0415
     write_training_status("running", date_from=date_from_str, date_to=date_to_str)
     try:
         from ml.trainer import train_models  # noqa: PLC0415
@@ -159,6 +160,8 @@ def _run_training(date_from_str: str, date_to_str: str) -> None:
             error=str(exc),
         )
         logging.error("[DASHBOARD] Training failed: %s", exc, exc_info=True)
+    finally:
+        _release_training_lock()  # always release lock so next run is not blocked
 
 
 # ---------------------------------------------------------------------------
@@ -813,13 +816,6 @@ with tabs[7]:
     _ts = read_training_status()
     _status = _ts.get("status")  # "running" | "complete" | "failed" | None
 
-    # Auto-refresh the page every 15 s while training is in progress
-    if _status == "running":
-        st.markdown(
-            '<meta http-equiv="refresh" content="15">',
-            unsafe_allow_html=True,
-        )
-
     # ---- Date pickers (disabled while training is in progress) ---------------
     st.subheader("1. Select Training Date Range")
     col_from, col_to = st.columns(2)
@@ -927,35 +923,59 @@ with tabs[7]:
     _btn_disabled = _picker_disabled or not confirmed
 
     if st.button(
-        f"🚀 Start Training  ({date_from_str} → {date_to_str})",
+        f"🚀 Start Training  ({date_from_str} to {date_to_str})",
         type="primary",
         disabled=_btn_disabled,
         use_container_width=True,
     ):
-        # Write "running" to disk immediately so the button disables on rerun
-        write_training_status("running", date_from=date_from_str, date_to=date_to_str)
-
-        _t = threading.Thread(
-            target=_run_training,
-            args=(date_from_str, date_to_str),
-            daemon=True,
-        )
-        _t.start()
-        st.rerun()
+        # Re-read status immediately before spawning to prevent double-spawn
+        # (user double-click or rapid reruns)
+        _current = read_training_status()
+        if _current.get("status") == "running":
+            st.warning(
+                f"Training is already in progress "
+                f"({_current.get('date_from','?')} to {_current.get('date_to','?')}). "
+                "Please wait for it to finish before starting a new run."
+            )
+            st.rerun()
+        else:
+            # Atomically mark running before spawning thread
+            write_training_status("running", date_from=date_from_str, date_to=date_to_str)
+            _t = threading.Thread(
+                target=_run_training,
+                args=(date_from_str, date_to_str),
+                daemon=True,
+            )
+            _t.start()
+            st.rerun()
 
     # ---- Training status panel (polled from disk) ----------------------------
     if _status == "running":
         _d_from = _ts.get("date_from", "?")
         _d_to   = _ts.get("date_to", "?")
         _updated = _ts.get("updated_at", "")
-        st.info(
-            f"⏳ **Training in progress** for records from **{_d_from}** to **{_d_to}**.\n\n"
-            f"Last updated: {_updated[:19].replace('T', ' ')} UTC\n\n"
-            "Training runs on Vertex AI and typically takes 1–3 hours. "
-            "This page auto-refreshes every 15 seconds. "
-            "You can safely navigate to other dashboard tabs while waiting.",
-            icon="⏳",
-        )
+        _lock_exists = (_ROOT / "training.lock").exists()
+        if _lock_exists:
+            st.info(
+                f"⏳ **Training in progress** for records from **{_d_from}** to **{_d_to}**.\n\n"
+                f"Last updated: {_updated[:19].replace('T', ' ')} UTC\n\n"
+                "Training runs on Vertex AI and typically takes 1–3 hours. "
+                "Refresh this page manually to check for updates. "
+                "You can safely navigate to other dashboard tabs while waiting.",
+                icon="⏳",
+            )
+        else:
+            st.warning(
+                f"⚠️ **Status is stuck on 'running'** (from {_updated[:19].replace('T', ' ')} UTC) "
+                "but no training process is active. The previous run may have crashed. "
+                "Click **Reset Status** to unlock the form.",
+            )
+            if st.button("Reset Status", type="secondary"):
+                try:
+                    TRAINING_STATUS_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                st.rerun()
 
     elif _status == "complete":
         st.success("✅ **Training complete!** Models have been deployed to Vertex AI.")

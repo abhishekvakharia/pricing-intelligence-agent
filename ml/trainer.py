@@ -55,6 +55,33 @@ _ML_VIEW_FULL = f"{GCP_PROJECT_ID}.{BQ_DATASET_NAME}.{_ML_VIEW_NAME}"
 # Path for persisting endpoint resource names (relative to project root)
 _ENDPOINTS_FILE = Path(__file__).resolve().parents[1] / "endpoints.json"
 
+# Shared training-status file (same file the dashboard polls)
+_TRAINING_STATUS_FILE = Path(__file__).resolve().parents[1] / "training_status.json"
+
+# Exclusive lock file created by train_models() itself — separate from the
+# status file so the dashboard can freely write 'running' without triggering
+# the guard.
+_TRAINING_LOCK_FILE = Path(__file__).resolve().parents[1] / "training.lock"
+
+
+def _acquire_training_lock() -> bool:
+    """Create the lock file atomically. Returns True if lock was acquired, False if already locked."""
+    try:
+        _TRAINING_LOCK_FILE.touch(exist_ok=False)  # fails if already exists
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return True  # if we can't create it, allow training (non-fatal)
+
+
+def _release_training_lock() -> None:
+    """Remove the lock file; errors are silently ignored."""
+    try:
+        _TRAINING_LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # BigQuery ML view DDL
@@ -96,7 +123,7 @@ SELECT
     mpn,
     digital_sku_number,
 
-    -- Customer & Org (INT64 → STRING for categorical encoding)
+    -- Customer & Org (INT64 -> STRING for categorical encoding)
     CAST(customer_number AS STRING) AS customer_number,
     CAST(customer_branch_number AS STRING) AS customer_branch_number,
     vendor_number,
@@ -134,7 +161,7 @@ SELECT
     floor_rule_cost_value,
     floor_rule_initial_amount,
 
-    -- Currency (STRING → FLOAT64 for arithmetic)
+    -- Currency (STRING -> FLOAT64 for arithmetic)
     CAST(currency_exchange_rate AS FLOAT64) AS currency_exchange_rate,
     currency_code_from,
     currency_code_to,
@@ -150,13 +177,14 @@ SELECT
     skip_gpe_discount_flag,
 
     -- Derived target and feature columns
-    CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END
+    -- quote_accepted cast to STRING so AutoML treats it as a categorical label
+    CAST(CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END AS STRING)
         AS quote_accepted,
     SAFE_DIVIDE(final_price_margin, NULLIF(calculated_price, 0)) * 100
         AS margin_pct,
-    CASE WHEN overriden_price IS NOT NULL THEN 1 ELSE 0 END
+    CAST(CASE WHEN overriden_price IS NOT NULL THEN 1 ELSE 0 END AS STRING)
         AS was_price_overridden,
-    CASE WHEN calculated_price = engine_floor_price THEN 1 ELSE 0 END
+    CAST(CASE WHEN calculated_price = engine_floor_price THEN 1 ELSE 0 END AS STRING)
         AS hit_floor_price
 
 FROM `{BQ_FULL_TABLE}`
@@ -278,19 +306,17 @@ def _verify_view_exists(bq_client: bigquery.Client) -> int:
 
 def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
     """
-    Deletes the pricing_ml_view in BigQuery and any existing Vertex AI models,
-    datasets, and endpoints with matching display names before recreating them.
+    Deletes existing Vertex AI models, datasets, and endpoints with matching
+    display names before recreating them.
+
+    The BQ view is intentionally NOT deleted here — the DDL uses
+    CREATE OR REPLACE VIEW, so it is safe to overwrite in place.  Deleting
+    it before training completes would break any in-flight Vertex AI job that
+    still holds a reference to the view.
 
     Errors are caught and logged — cleanup failures do not abort training.
     """
-    # ── Delete BQ view ──────────────────────────────────────────────────────
-    try:
-        bq_client.delete_table(_ML_VIEW_FULL, not_found_ok=True)
-        logging.info("[TRAINER] Deleted BQ view (if existed): %s", _ML_VIEW_FULL)
-    except Exception as e:
-        logging.warning("[TRAINER] Could not delete BQ view %s: %s", _ML_VIEW_FULL, e)
-
-    # ── Delete existing Vertex AI endpoints first (before deleting models) ───
+    # ── Delete existing Vertex AI endpoints first (must undeploy before model delete) ──
     for display_name in [
         f"{CONVERSION_MODEL_DISPLAY_NAME}-endpoint",
         f"{MARGIN_MODEL_DISPLAY_NAME}-endpoint",
@@ -298,6 +324,7 @@ def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
         _delete_endpoint_if_exists(display_name)
 
     # ── Delete existing Vertex AI models by display name ────────────────────
+    # Models can only be deleted after all endpoints referencing them are gone.
     for display_name in [CONVERSION_MODEL_DISPLAY_NAME, MARGIN_MODEL_DISPLAY_NAME]:
         try:
             existing_models = aiplatform.Model.list(
@@ -310,7 +337,7 @@ def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
                     model.display_name, model.resource_name,
                 )
                 try:
-                    model.delete()
+                    model.delete(sync=True)  # block until deletion confirmed
                     logging.info("[TRAINER] Deleted model: %s", display_name)
                 except Exception as me:
                     logging.warning(
@@ -330,7 +357,7 @@ def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
                 "[TRAINER] Deleting existing Vertex AI dataset: %s", ds.resource_name
             )
             try:
-                ds.delete()
+                ds.delete(sync=True)  # block until deletion confirmed
             except Exception as de:
                 logging.warning("[TRAINER] Could not delete dataset: %s", de)
     except Exception as e:
@@ -341,8 +368,9 @@ def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
 
 def _delete_endpoint_if_exists(display_name: str) -> None:
     """
-    Undeploys all models and deletes a Vertex AI endpoint by display name if
-    it exists.  Errors are caught and logged — non-fatal.
+    Undeploys all models from a Vertex AI endpoint and deletes it, blocking
+    until the operations complete so that the model can be safely deleted next.
+    Errors are caught and logged — non-fatal.
     """
     try:
         existing = aiplatform.Endpoint.list(
@@ -354,8 +382,8 @@ def _delete_endpoint_if_exists(display_name: str) -> None:
                 "[TRAINER] Undeploying all models from endpoint: %s", ep.resource_name
             )
             try:
-                ep.undeploy_all()
-                ep.delete()
+                ep.undeploy_all(sync=True)  # block — model delete will fail if deployed
+                ep.delete(sync=True)        # block until deletion confirmed
                 logging.info("[TRAINER] Deleted endpoint: %s", display_name)
             except Exception as e:
                 logging.warning(
@@ -415,15 +443,35 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     Exception
         Re-raised from Vertex AI SDK on training/deployment failures.
     """
+    # Guard: refuse to start if another train_models() call is already running.
+    # Uses a dedicated lock file (training.lock) rather than training_status.json
+    # to avoid the race where the dashboard pre-writes 'running' before spawning
+    # the thread, which would make train_models() think it is already in progress.
+    if not _acquire_training_lock():
+        try:
+            _existing = json.loads(_TRAINING_STATUS_FILE.read_text(encoding="utf-8"))
+            _d_from = _existing.get("date_from", "?")
+            _d_to   = _existing.get("date_to",   "?")
+            _since  = _existing.get("updated_at", "")[:19].replace("T", " ")
+        except Exception:
+            _d_from = _d_to = "?"
+            _since = ""
+        raise RuntimeError(
+            f"A training job is already in progress (date range {_d_from} to {_d_to}, "
+            f"started ~{_since} UTC). "
+            "Wait for it to complete or cancel it in the Vertex AI console before "
+            "starting a new run."
+        )
+
     logging.info(
-        "[TRAINER] ===== Training pipeline START  %s → %s =====",
+        "[TRAINER] ===== Training pipeline START  %s to %s =====",
         date_from, date_to,
     )
 
     bq_client = bigquery.Client(project=GCP_PROJECT_ID)
 
     # ── Step 1: Validate source row count ────────────────────────────────────
-    _step(1, _TOTAL_STEPS, f"Validating source row count for {date_from} → {date_to}")
+    _step(1, _TOTAL_STEPS, f"Validating source row count for {date_from} to {date_to}")
     count_sql = f"""
         SELECT COUNT(*) AS cnt
         FROM `{BQ_FULL_TABLE}`
@@ -443,8 +491,37 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     if row_count == 0:
         raise ValueError(
             f"No records found in `{BQ_FULL_TABLE}` "
-            f"for the date range {date_from} → {date_to}. "
+            f"for the date range {date_from} to {date_to}. "
             "Adjust the date range before training."
+        )
+
+    # Check quote_accepted class balance — AutoML classification requires >= 2 classes
+    balance_sql = f"""
+        SELECT
+            COUNTIF(order_key IS NOT NULL) AS accepted,
+            COUNTIF(order_key IS NULL)     AS not_accepted
+        FROM `{BQ_FULL_TABLE}`
+        WHERE created >= TIMESTAMP('{date_from}')
+          AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
+    """
+    bal_rows = list(bq_client.query(balance_sql).result())
+    accepted_count = int(bal_rows[0]["accepted"])
+    not_accepted_count = int(bal_rows[0]["not_accepted"])
+    logging.info(
+        "[TRAINER] Class balance: accepted=%d  not_accepted=%d",
+        accepted_count, not_accepted_count,
+    )
+    print(f"  Class balance: accepted={accepted_count:,}  not_accepted={not_accepted_count:,}")
+    train_conversion = accepted_count > 0 and not_accepted_count > 0
+    if not train_conversion:
+        logging.warning(
+            "[TRAINER] quote_accepted has only one class (%d accepted, %d not_accepted) "
+            "for this date range. Conversion classifier will be skipped.",
+            accepted_count, not_accepted_count,
+        )
+        print(
+            "  WARNING: quote_accepted is single-class for this date range "
+            "-- conversion model will be skipped. Only the margin regressor will be trained."
         )
 
     # ── Step 2: Initialise Vertex AI SDK ─────────────────────────────────────
@@ -488,30 +565,37 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     print(f"  Dataset: {dataset.resource_name}")
 
     # ── Step 7: Train conversion classifier ──────────────────────────────────
-    _step(7, _TOTAL_STEPS, f"Training conversion classifier: {CONVERSION_MODEL_DISPLAY_NAME}")
-    conversion_job = AutoMLTabularTrainingJob(
-        display_name=CONVERSION_MODEL_DISPLAY_NAME,
-        optimization_prediction_type="classification",
-        optimization_objective="minimize-log-loss",
-        column_transformations=COLUMN_TRANSFORMATIONS,
-    )
-    model_conversion = conversion_job.run(
-        dataset=dataset,
-        target_column="quote_accepted",
-        budget_milli_node_hours=1000,
-        model_display_name=CONVERSION_MODEL_DISPLAY_NAME,
-        sync=True,  # block until job finishes — surface any errors immediately
-    )
-    if conversion_job.has_failed:
-        raise RuntimeError(
-            f"Conversion classifier training failed. "
-            f"State: {conversion_job.state}. "
-            f"Check Vertex AI console for pipeline details."
+    model_conversion = None
+    if train_conversion:
+        _step(7, _TOTAL_STEPS, f"Training conversion classifier: {CONVERSION_MODEL_DISPLAY_NAME}")
+        conversion_job = AutoMLTabularTrainingJob(
+            display_name=CONVERSION_MODEL_DISPLAY_NAME,
+            optimization_prediction_type="classification",
+            optimization_objective="minimize-log-loss",
+            column_transformations=COLUMN_TRANSFORMATIONS,
         )
-    logging.info(
-        "[TRAINER] Conversion model trained: %s", model_conversion.resource_name
-    )
-    print(f"  Conversion model: {model_conversion.resource_name}")
+        model_conversion = conversion_job.run(
+            dataset=dataset,
+            target_column="quote_accepted",
+            budget_milli_node_hours=1000,
+            model_display_name=CONVERSION_MODEL_DISPLAY_NAME,
+            training_fraction_split=0.8,
+            validation_fraction_split=0.1,
+            test_fraction_split=0.1,
+            sync=True,  # block until job finishes — surface any errors immediately
+        )
+        if conversion_job.has_failed:
+            raise RuntimeError(
+                f"Conversion classifier training failed. "
+                f"State: {conversion_job.state}. "
+                f"Check Vertex AI console for pipeline details."
+            )
+        logging.info(
+            "[TRAINER] Conversion model trained: %s", model_conversion.resource_name
+        )
+        print(f"  Conversion model: {model_conversion.resource_name}")
+    else:
+        _step(7, _TOTAL_STEPS, "Skipping conversion classifier (single-class label in date range)")
 
     # ── Step 8: Train margin regressor ───────────────────────────────────────
     _step(8, _TOTAL_STEPS, f"Training margin regressor: {MARGIN_MODEL_DISPLAY_NAME}")
@@ -526,6 +610,9 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         target_column="margin_pct",
         budget_milli_node_hours=1000,
         model_display_name=MARGIN_MODEL_DISPLAY_NAME,
+        training_fraction_split=0.8,
+        validation_fraction_split=0.1,
+        test_fraction_split=0.1,
         sync=True,  # block until job finishes — surface any errors immediately
     )
     if margin_job.has_failed:
@@ -542,12 +629,15 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
     # ── Step 9: Fetch evaluation metrics ─────────────────────────────────────
     _step(9, _TOTAL_STEPS, "Fetching evaluation metrics from Vertex AI")
 
-    conv_evaluations = model_conversion.list_model_evaluations()
     conv_metrics: dict = {}
-    if conv_evaluations:
-        conv_metrics = dict(conv_evaluations[0].metrics)
+    if model_conversion is not None:
+        conv_evaluations = model_conversion.list_model_evaluations()
+        if conv_evaluations:
+            conv_metrics = dict(conv_evaluations[0].metrics)
+        else:
+            logging.warning("[TRAINER] No evaluation metrics returned for conversion model")
     else:
-        logging.warning("[TRAINER] No evaluation metrics returned for conversion model")
+        logging.info("[TRAINER] Conversion model was skipped — no metrics to fetch")
 
     margin_evaluations = model_margin.list_model_evaluations()
     margin_metrics: dict = {}
@@ -561,39 +651,44 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         conv_metrics.get("auRoc"), conv_metrics.get("logLoss"),
     )
     logging.info(
-        "[TRAINER] Margin metrics — RMSE: %s  R²: %s  MAE: %s",
+        "[TRAINER] Margin metrics - RMSE: %s  R2: %s  MAE: %s",
         margin_metrics.get("rootMeanSquaredError"),
         margin_metrics.get("rSquared"),
         margin_metrics.get("meanAbsoluteError"),
     )
     print(
-        f"  Conversion — AUC: {conv_metrics.get('auRoc')}  "
+        f"  Conversion - AUC: {conv_metrics.get('auRoc')}  "
         f"LogLoss: {conv_metrics.get('logLoss')}"
     )
     print(
-        f"  Margin     — RMSE: {margin_metrics.get('rootMeanSquaredError')}  "
-        f"R²: {margin_metrics.get('rSquared')}  "
+        f"  Margin     - RMSE: {margin_metrics.get('rootMeanSquaredError')}  "
+        f"R2: {margin_metrics.get('rSquared')}  "
         f"MAE: {margin_metrics.get('meanAbsoluteError')}"
     )
 
     # ── Step 10: Deploy both models + save endpoints.json ────────────────────
     _step(10, _TOTAL_STEPS, "Deploying models to Vertex AI Endpoints")
 
-    conv_endpoint_display_name = f"{CONVERSION_MODEL_DISPLAY_NAME}-endpoint"
-    logging.info("[TRAINER] Deploying conversion model → %s", conv_endpoint_display_name)
-    _delete_endpoint_if_exists(conv_endpoint_display_name)
-    conv_endpoint = model_conversion.deploy(
-        deployed_model_display_name=conv_endpoint_display_name,
-        machine_type="n1-standard-4",
-        min_replica_count=1,
-        max_replica_count=2,
-        sync=True,
-    )
-    logging.info("[TRAINER] Conversion endpoint: %s", conv_endpoint.resource_name)
-    print(f"  Conversion endpoint: {conv_endpoint.resource_name}")
+    conv_endpoint = None
+    if model_conversion is not None:
+        conv_endpoint_display_name = f"{CONVERSION_MODEL_DISPLAY_NAME}-endpoint"
+        logging.info("[TRAINER] Deploying conversion model -> %s", conv_endpoint_display_name)
+        _delete_endpoint_if_exists(conv_endpoint_display_name)
+        conv_endpoint = model_conversion.deploy(
+            deployed_model_display_name=conv_endpoint_display_name,
+            machine_type="n1-standard-4",
+            min_replica_count=1,
+            max_replica_count=2,
+            sync=True,
+        )
+        logging.info("[TRAINER] Conversion endpoint: %s", conv_endpoint.resource_name)
+        print(f"  Conversion endpoint: {conv_endpoint.resource_name}")
+    else:
+        logging.info("[TRAINER] Conversion model was skipped — no endpoint to deploy")
+        print("  Conversion endpoint: skipped (single-class label)")
 
     margin_endpoint_display_name = f"{MARGIN_MODEL_DISPLAY_NAME}-endpoint"
-    logging.info("[TRAINER] Deploying margin model → %s", margin_endpoint_display_name)
+    logging.info("[TRAINER] Deploying margin model -> %s", margin_endpoint_display_name)
     _delete_endpoint_if_exists(margin_endpoint_display_name)
     margin_endpoint = model_margin.deploy(
         deployed_model_display_name=margin_endpoint_display_name,
@@ -607,10 +702,10 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
 
     # Persist endpoint resource names to disk
     endpoints_payload = {
-        "conversion_endpoint": conv_endpoint.resource_name,
+        "conversion_endpoint": conv_endpoint.resource_name if conv_endpoint else None,
         "margin_endpoint":     margin_endpoint.resource_name,
     }
-    _ENDPOINTS_FILE.write_text(json.dumps(endpoints_payload, indent=2))
+    _ENDPOINTS_FILE.write_text(json.dumps(endpoints_payload, indent=2), encoding="utf-8")
     logging.info("[TRAINER] Endpoints saved to %s", _ENDPOINTS_FILE)
     print(f"  Endpoints written to {_ENDPOINTS_FILE}")
 
@@ -620,8 +715,9 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         "margin_rmse":         margin_metrics.get("rootMeanSquaredError"),
         "margin_r2":           margin_metrics.get("rSquared"),
         "margin_mae":          margin_metrics.get("meanAbsoluteError"),
-        "conversion_endpoint": conv_endpoint.resource_name,
+        "conversion_endpoint": conv_endpoint.resource_name if conv_endpoint else None,
         "margin_endpoint":     margin_endpoint.resource_name,
+        "conversion_skipped":  not train_conversion,
     }
     logging.info(
         "[TRAINER] ===== Training pipeline COMPLETE  results=%s =====", results

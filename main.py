@@ -127,6 +127,13 @@ if __name__ == "__main__":
     logging.info("[MAIN] Open http://localhost:8501 to use the dashboard.")
     logging.info("[MAIN] Starting agent HTTP server on port 8502…")
 
+    # Route ADK to Vertex AI so existing gcloud / ADC credentials are used.
+    # These must be set before agent.server (and therefore agent.agent) is imported.
+    import config as _cfg  # noqa: PLC0415
+    os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "1")
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", _cfg.GCP_PROJECT_ID)
+    os.environ.setdefault("GOOGLE_CLOUD_LOCATION", _cfg.VERTEX_REGION)
+
     from agent.server import start_agent_server  # noqa: PLC0415
 
     start_agent_server(port=8502)
