@@ -2,7 +2,7 @@
 ml/trainer.py
 Vertex AI AutoML Tabular training pipeline for the Pricing Intelligence Agent.
 
-All training runs entirely on GCP — no local ML libraries are required.
+All training runs entirely on GCP -- no local ML libraries are required.
 
 Steps executed by train_models():
   1. Validate row count for the given date range
@@ -11,8 +11,8 @@ Steps executed by train_models():
   4. Verify the view was created and has rows
   5. Register the view as a Vertex AI Managed TabularDataset
   6. Launch AutoML Tabular training for:
-       • Model 1  — Conversion Classifier  (target: quote_accepted)
-       • Model 2  — Margin Regressor       (target: margin_pct)
+       * Model 1  -- Conversion Classifier  (target: quote_accepted)
+       * Model 2  -- Margin Regressor       (target: margin_pct)
   7. Fetch model-level evaluation metrics
   8. Deploy both models to Vertex AI Endpoints
   9. Persist endpoint resource names to endpoints.json
@@ -20,9 +20,9 @@ Steps executed by train_models():
 
 Schema notes for price_fact_us:
   - No SCD columns (db_rec_del_flag, db_rec_close_date, REGION, etc.)
-  - BOOL flags: use as-is — AutoML handles BOOL natively
-  - final_cost, currency_exchange_rate: stored as STRING — CAST to FLOAT64
-  - customer_number, customer_branch_number: stored as INT64 — CAST to STRING
+  - BOOL flags: use as-is -- AutoML handles BOOL natively
+  - final_cost, currency_exchange_rate: stored as STRING -- CAST to FLOAT64
+  - customer_number, customer_branch_number: stored as INT64 -- CAST to STRING
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ _ENDPOINTS_FILE = Path(__file__).resolve().parents[1] / "endpoints.json"
 # Shared training-status file (same file the dashboard polls)
 _TRAINING_STATUS_FILE = Path(__file__).resolve().parents[1] / "training_status.json"
 
-# Exclusive lock file created by train_models() itself — separate from the
+# Exclusive lock file created by train_models() itself -- separate from the
 # status file so the dashboard can freely write 'running' without triggering
 # the guard.
 _TRAINING_LOCK_FILE = Path(__file__).resolve().parents[1] / "training.lock"
@@ -87,16 +87,18 @@ def _release_training_lock() -> None:
 # BigQuery ML view DDL
 # ---------------------------------------------------------------------------
 
-def build_ml_view_sql(date_from: str, date_to: str) -> str:
+def _table_has_column(bq_client: bigquery.Client, column_name: str) -> bool:
+    """Return True if *column_name* exists in the source BQ table schema."""
+    try:
+        table = bq_client.get_table(BQ_FULL_TABLE)
+        return any(f.name.lower() == column_name.lower() for f in table.schema)
+    except Exception:
+        return False
+
+
+def build_ml_view_sql(date_from: str, date_to: str, has_sow_scale_col: bool = False) -> str:
     """
     Build the CREATE OR REPLACE VIEW DDL for the Vertex AI training dataset.
-
-    Removes all columns not present in price_fact_us (REGION,
-    VENDOR_LOB_LVL2_DES, VENDOR_LOB_LVL3_DES, SoW_final_org_scale,
-    price_fact_key, db_rec_* columns).
-
-    Casts STRING-stored numeric columns (final_cost, currency_exchange_rate)
-    to FLOAT64 for arithmetic.  BOOL flag columns are used as-is.
 
     Parameters
     ----------
@@ -104,12 +106,16 @@ def build_ml_view_sql(date_from: str, date_to: str) -> str:
         Lower bound date string (YYYY-MM-DD), inclusive.
     date_to : str
         Upper bound date string (YYYY-MM-DD), inclusive.
+    has_sow_scale_col : bool
+        Whether SoW_final_org_scale exists in the source table. If True,
+        rows with NULL in that column are excluded.
 
     Returns
     -------
     str
         A complete CREATE OR REPLACE VIEW SQL statement.
     """
+    _sow_filter = "\n  AND SoW_final_org_scale IS NOT NULL" if has_sow_scale_col else ""
     return f"""
 CREATE OR REPLACE VIEW `{_ML_VIEW_FULL}` AS
 SELECT
@@ -166,7 +172,7 @@ SELECT
     currency_code_from,
     currency_code_to,
 
-    -- BOOL flags — AutoML handles BOOL natively
+    -- BOOL flags -- AutoML handles BOOL natively
     reciprocal_flag,
     allow_quantity_break_flag,
     allow_floor_flag,
@@ -180,7 +186,7 @@ SELECT
     -- quote_accepted cast to STRING so AutoML treats it as a categorical label
     CAST(CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END AS STRING)
         AS quote_accepted,
-    SAFE_DIVIDE(final_price_margin, NULLIF(calculated_price, 0)) * 100
+    final_price_margin
         AS margin_pct,
     CAST(CASE WHEN overriden_price IS NOT NULL THEN 1 ELSE 0 END AS STRING)
         AS was_price_overridden,
@@ -190,9 +196,9 @@ SELECT
 FROM `{BQ_FULL_TABLE}`
 WHERE created >= TIMESTAMP('{date_from}')
   AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
-  AND final_price_margin IS NOT NULL
+  AND final_price_margin > 0
   AND calculated_price IS NOT NULL
-  AND calculated_price != 0
+  AND calculated_price != 0{_sow_filter}
 """
 
 
@@ -200,7 +206,7 @@ WHERE created >= TIMESTAMP('{date_from}')
 # Column transformation specs for AutoML
 # ---------------------------------------------------------------------------
 
-# Numeric columns — both models
+# Numeric columns -- both models
 NUMERIC_COLS = [
     "calculated_price",
     "base_price",
@@ -239,7 +245,7 @@ CATEGORICAL_COLS = [
     "currency_code_to",
 ]
 
-# BOOL columns — declared as categorical so AutoML handles them correctly
+# BOOL columns -- declared as categorical so AutoML handles them correctly
 BOOL_COLS = [
     "reciprocal_flag",
     "allow_quantity_break_flag",
@@ -260,7 +266,7 @@ COLUMN_TRANSFORMATIONS: list[dict] = (
     + [{"categorical": {"column_name": c}} for c in BOOL_COLS]
 )
 
-# Margin model transformation list — exclude margin_pct (it's the target)
+# Margin model transformation list -- exclude margin_pct (it's the target)
 MARGIN_COLUMN_TRANSFORMATIONS: list[dict] = [
     t for t in COLUMN_TRANSFORMATIONS
     if t.get("numeric", {}).get("column_name") != "margin_pct"
@@ -288,7 +294,7 @@ def _verify_view_exists(bq_client: bigquery.Client) -> int:
     ------
     RuntimeError
         If the view has 0 rows (DDL succeeded but the source table returned
-        nothing — likely a bad date filter).
+        nothing - likely a bad date filter).
     """
     count_sql = f"SELECT COUNT(*) AS cnt FROM `{_ML_VIEW_FULL}`"
     logging.info("[TRAINER] Verifying view: %s", count_sql)
@@ -298,13 +304,13 @@ def _verify_view_exists(bq_client: bigquery.Client) -> int:
     if view_cnt == 0:
         raise RuntimeError(
             f"BigQuery ML view `{_ML_VIEW_FULL}` was created but contains 0 rows. "
-            "Check the date filter — the source table may have no data for this range."
+            "Check the date filter -- the source table may have no data for this range."
         )
     return view_cnt
 
 
 # ---------------------------------------------------------------------------
-# Cleanup helpers — idempotent, errors are non-fatal
+# Cleanup helpers -- idempotent, errors are non-fatal
 # ---------------------------------------------------------------------------
 
 def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
@@ -312,12 +318,12 @@ def cleanup_existing_resources(bq_client: bigquery.Client) -> None:
     Deletes existing Vertex AI models, datasets, and endpoints with matching
     display names before recreating them.
 
-    The BQ view is intentionally NOT deleted here — the DDL uses
+    The BQ view is intentionally NOT deleted here -- the DDL uses
     CREATE OR REPLACE VIEW, so it is safe to overwrite in place.  Deleting
     it before training completes would break any in-flight Vertex AI job that
     still holds a reference to the view.
 
-    Errors are caught and logged — cleanup failures do not abort training.
+    Errors are caught and logged -- cleanup failures do not abort training.
     """
     # ── Delete existing Vertex AI endpoints first (must undeploy before model delete) ──
     for display_name in [
@@ -373,7 +379,7 @@ def _delete_endpoint_if_exists(display_name: str) -> None:
     """
     Undeploys all models from a Vertex AI endpoint and deletes it, blocking
     until the operations complete so that the model can be safely deleted next.
-    Errors are caught and logged — non-fatal.
+    Errors are caught and logged -- non-fatal.
     """
     try:
         existing = aiplatform.Endpoint.list(
@@ -385,7 +391,7 @@ def _delete_endpoint_if_exists(display_name: str) -> None:
                 "[TRAINER] Undeploying all models from endpoint: %s", ep.resource_name
             )
             try:
-                ep.undeploy_all(sync=True)  # block — model delete will fail if deployed
+                ep.undeploy_all(sync=True)  # block -- model delete will fail if deployed
                 ep.delete(sync=True)        # block until deletion confirmed
                 logging.info("[TRAINER] Deleted endpoint: %s", display_name)
             except Exception as e:
@@ -498,7 +504,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
             "Adjust the date range before training."
         )
 
-    # Check quote_accepted class balance — AutoML classification requires >= 2 classes
+    # Check quote_accepted class balance -- AutoML classification requires >= 2 classes
     balance_sql = f"""
         SELECT
             COUNTIF(order_key IS NOT NULL) AS accepted,
@@ -542,7 +548,9 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
 
     # ── Step 4: Create BigQuery ML view ───────────────────────────────────────
     _step(4, _TOTAL_STEPS, f"Creating BigQuery ML view `{_ML_VIEW_FULL}`")
-    view_sql = build_ml_view_sql(date_from, date_to)
+    _has_sow = _table_has_column(bq_client, "SoW_final_org_scale")
+    logging.info("[TRAINER] SoW_final_org_scale present in source table: %s", _has_sow)
+    view_sql = build_ml_view_sql(date_from, date_to, has_sow_scale_col=_has_sow)
     logging.info("[TRAINER] ML view DDL:\n%s", view_sql)
     view_job = bq_client.query(view_sql)
     view_job.result()  # blocks until complete
@@ -585,7 +593,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
             training_fraction_split=0.8,
             validation_fraction_split=0.1,
             test_fraction_split=0.1,
-            sync=True,  # block until job finishes — surface any errors immediately
+            sync=True,  # block until job finishes -- surface any errors immediately
         )
         if conversion_job.has_failed:
             raise RuntimeError(
@@ -616,7 +624,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         training_fraction_split=0.8,
         validation_fraction_split=0.1,
         test_fraction_split=0.1,
-        sync=True,  # block until job finishes — surface any errors immediately
+        sync=True,  # block until job finishes -- surface any errors immediately
     )
     if margin_job.has_failed:
         raise RuntimeError(
@@ -640,7 +648,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         else:
             logging.warning("[TRAINER] No evaluation metrics returned for conversion model")
     else:
-        logging.info("[TRAINER] Conversion model was skipped — no metrics to fetch")
+        logging.info("[TRAINER] Conversion model was skipped -- no metrics to fetch")
 
     margin_evaluations = model_margin.list_model_evaluations()
     margin_metrics: dict = {}
@@ -650,7 +658,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         logging.warning("[TRAINER] No evaluation metrics returned for margin model")
 
     logging.info(
-        "[TRAINER] Conversion metrics — AUC: %s  LogLoss: %s",
+        "[TRAINER] Conversion metrics -- AUC: %s  LogLoss: %s",
         conv_metrics.get("auRoc"), conv_metrics.get("logLoss"),
     )
     logging.info(
@@ -687,7 +695,7 @@ def train_models(date_from: str, date_to: str) -> dict[str, Any]:
         logging.info("[TRAINER] Conversion endpoint: %s", conv_endpoint.resource_name)
         print(f"  Conversion endpoint: {conv_endpoint.resource_name}")
     else:
-        logging.info("[TRAINER] Conversion model was skipped — no endpoint to deploy")
+        logging.info("[TRAINER] Conversion model was skipped -- no endpoint to deploy")
         print("  Conversion endpoint: skipped (single-class label)")
 
     margin_endpoint_display_name = f"{MARGIN_MODEL_DISPLAY_NAME}-endpoint"

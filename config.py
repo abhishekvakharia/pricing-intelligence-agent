@@ -2,7 +2,7 @@
 
 GCP_PROJECT_ID = "imgcp-20260224090629"
 BQ_DATASET_NAME = "Pricing_Dataset"
-BQ_TABLE_NAME   = "price_fact_gpe_us"
+BQ_TABLE_NAME   = "price_facts"
 
 # Derived full table reference — do not edit
 BQ_FULL_TABLE = f"{GCP_PROJECT_ID}.{BQ_DATASET_NAME}.{BQ_TABLE_NAME}"
