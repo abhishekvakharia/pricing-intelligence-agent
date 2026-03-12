@@ -190,6 +190,9 @@ SELECT
 FROM `{BQ_FULL_TABLE}`
 WHERE created >= TIMESTAMP('{date_from}')
   AND created < TIMESTAMP_ADD(TIMESTAMP('{date_to}'), INTERVAL 1 DAY)
+  AND final_price_margin IS NOT NULL
+  AND calculated_price IS NOT NULL
+  AND calculated_price != 0
 """
 
 
